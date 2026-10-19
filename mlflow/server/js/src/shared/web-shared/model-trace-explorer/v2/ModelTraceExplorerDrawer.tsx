@@ -195,6 +195,8 @@ const drawerSlideOutAnimation = keyframes({
 
 export interface ModelTraceExplorerDrawerProps {
   children: React.ReactNode;
+  /** Shown between the previous and next buttons, e.g. the position in a list. */
+  navigationLabel?: React.ReactNode;
   selectPreviousEval: () => void;
   selectNextEval: () => void;
   isPreviousAvailable: boolean;
@@ -231,6 +233,7 @@ export interface ModelTraceExplorerDrawerProps {
 }
 
 export const ModelTraceExplorerDrawer = ({
+  navigationLabel,
   selectPreviousEval,
   selectNextEval,
   isPreviousAvailable,
@@ -1332,6 +1335,7 @@ export const ModelTraceExplorerDrawer = ({
                 size="small"
               />
             </Tooltip>
+            {navigationLabel}
             <Tooltip componentId="mlflow.evaluations_review.modal.next-tooltip" content={nextTraceLabel}>
               <Button
                 componentId="mlflow.evaluations_review.modal.next_eval"
