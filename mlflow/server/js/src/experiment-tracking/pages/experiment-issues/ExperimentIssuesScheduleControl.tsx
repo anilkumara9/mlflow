@@ -13,7 +13,7 @@ import {
   Typography,
   useDesignSystemTheme,
 } from '@databricks/design-system';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { generateRandomName } from '../../../common/utils/NameUtils';
 import { useApiKeyConfiguration } from '../../../gateway/components/model-configuration/hooks/useApiKeyConfiguration';
@@ -24,7 +24,13 @@ import {
   IssueDetectionModelDropdown,
   type IssueDetectionModelSelection,
 } from '../../components/experiment-page/components/traces-v3/IssueDetectionModelDropdown';
-import { MAX_TRACE_FILTERS, unsupportedFilterCharacter } from './issueDetectionSchedule';
+import {
+  DEFAULT_ISSUE_DETECTION_START_TIME,
+  MAX_TRACE_FILTERS,
+  issueDetectionStartTimeOptions,
+  resolveScheduleTimezone,
+  unsupportedFilterCharacter,
+} from './issueDetectionSchedule';
 import type {
   IssueDetectionScheduleModel,
   ScheduleTraceFilter,
@@ -290,11 +296,23 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
   // Replaces upstream's experiment-ACL check: OSS has no per-experiment write permission for
   // tags, but it does have servers that cannot run a schedule at all.
   const scheduledDetectionAvailable = useScheduledDetectionAvailable();
-  const { setting, traceFilters, model, isLoading, isUpdating, loadError, retryLoad, setSetting } =
-    useIssueDetectionSchedule({ experimentId });
+  const {
+    setting,
+    traceFilters,
+    model,
+    startTime: storedStartTime,
+    timezone,
+    isLoading,
+    isUpdating,
+    loadError,
+    retryLoad,
+    setSetting,
+  } = useIssueDetectionSchedule({ experimentId });
 
   const [open, setOpen] = useState(false);
   const [cadence, setCadence] = useState<IssueDetectionScheduleSetting>('off');
+  // Time of day the cadence fires, `HH:MM` in the schedule's timezone.
+  const [startTime, setStartTime] = useState(DEFAULT_ISSUE_DETECTION_START_TIME);
   const [filters, setFilters] = useState<ScheduleTraceFilter[]>([]);
   // The model the scheduled runs will use. Null until the stored selection (or the default) is
   // resolved, which needs the endpoint list.
@@ -390,6 +408,7 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
   // filters we show no rows — just the "Add filter" button — so the user opts in explicitly.
   const openModal = useCallback(() => {
     setCadence(setting);
+    setStartTime(storedStartTime);
     setFilters(traceFilters.map((filter) => ({ ...filter })));
     setSaveFailed(false);
     setFilterError(null);
@@ -399,7 +418,7 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
     setCreatedSecret(null);
     resetCreateSecret();
     setOpen(true);
-  }, [setting, traceFilters, model, resetCreateSecret]);
+  }, [setting, storedStartTime, traceFilters, model, resetCreateSecret]);
   const closeModal = useCallback(() => setOpen(false), []);
 
   // A schedule that names no model (or one saved before a model could be chosen) falls back to the
@@ -434,6 +453,14 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
     () => setFilters((prev) => (prev.length >= MAX_TRACE_FILTERS ? prev : [...prev, emptyFilterRow()])),
     [],
   );
+
+  // The quarter hours the dispatcher can honour, plus the stored time when it is not one of them:
+  // a schedule set by hand to 09:08 is shown and saved as 09:08 rather than being moved to a
+  // neighbouring quarter hour by having been looked at. Sorts correctly as text, zero-padded.
+  const startTimeOptions = useMemo(() => {
+    const offered = issueDetectionStartTimeOptions();
+    return offered.includes(startTime) ? offered : [...offered, startTime].sort();
+  }, [startTime]);
 
   const persistSchedule = useCallback(
     async (secretId?: string) => {
@@ -484,6 +511,7 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
         // intact so the user can retry without re-entering the cadence/filters.
         await setSetting({
           setting: cadence,
+          startTime,
           traceFilters: cleaned,
           model: selection
             ? toStoredModel(selection, resolveSecretId(selection, model, secretId, existingSecrets[0]?.secret_id))
@@ -494,7 +522,7 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
         setSaveFailed(true);
       }
     },
-    [cadence, filters, selection, model, existingSecrets, setSetting, intl],
+    [cadence, startTime, filters, selection, model, existingSecrets, setSetting, intl],
   );
 
   // Prompting for a key before these answer would ask for one the server may already have.
@@ -615,6 +643,10 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
     defaultMessage: 'Cadence',
     description: 'Experiment issues tab > Schedule modal label for the run cadence',
   });
+  const startTimeRowLabel = intl.formatMessage({
+    defaultMessage: 'Start time',
+    description: 'Experiment issues tab > Schedule modal label for the time of day a run starts',
+  });
   const modelRowLabel = intl.formatMessage({
     defaultMessage: 'Model',
     description: 'Experiment issues tab > Schedule modal label for the model scheduled runs analyze with',
@@ -624,6 +656,28 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
     description: 'Experiment issues tab > Schedule modal label for the optional trace filters',
   });
   const filtersDisabled = cadence === 'off';
+  // The zone a save would store, so the time above is never shown without the zone it is read in.
+  const scheduleTimezone = resolveScheduleTimezone(timezone);
+  // Only for the two cadences the modal offers. A stored hourly schedule fires every hour at this
+  // minute, which neither sentence describes, and the cadence select cannot reach it anyway.
+  const whenItRuns =
+    cadence === 'weekly'
+      ? intl.formatMessage(
+          {
+            defaultMessage: 'Runs every Monday at {time} ({timezone}).',
+            description: 'Experiment issues tab > Schedule modal line stating when a weekly scheduled run starts',
+          },
+          { time: startTime, timezone: scheduleTimezone },
+        )
+      : cadence === 'daily'
+        ? intl.formatMessage(
+            {
+              defaultMessage: 'Runs every day at {time} ({timezone}).',
+              description: 'Experiment issues tab > Schedule modal line stating when a daily scheduled run starts',
+            },
+            { time: startTime, timezone: scheduleTimezone },
+          )
+        : null;
   // An active schedule has to name the model it will run on. `selection` is null until the
   // endpoint list resolves, and a save made in that gap stores no model at all -- the run would
   // then use the server's default rather than what this dialog was about to show, and the
@@ -741,6 +795,27 @@ export const ExperimentIssuesScheduleControl = ({ experimentId }: ExperimentIssu
                     </SimpleSelectOption>
                   ))}
                 </SimpleSelect>
+              </div>
+              <div css={{ display: 'flex', flexDirection: 'column', gap: theme.spacing.xs }}>
+                <Typography.Text color="secondary">{startTimeRowLabel}</Typography.Text>
+                <div css={{ width: MODEL_PICKER_WIDTH }}>
+                  <SimpleSelect
+                    id={`${COMPONENT_ID}.modal.start-time`}
+                    componentId={`${COMPONENT_ID}.modal.start-time`}
+                    label={startTimeRowLabel}
+                    value={startTime}
+                    disabled={filtersDisabled}
+                    onChange={({ target }) => setStartTime(target.value)}
+                    contentProps={{ style: { zIndex: theme.options.zIndexBase + 40 } }}
+                  >
+                    {startTimeOptions.map((option) => (
+                      <SimpleSelectOption key={option} value={option}>
+                        {option}
+                      </SimpleSelectOption>
+                    ))}
+                  </SimpleSelect>
+                </div>
+                {whenItRuns && <Typography.Hint>{whenItRuns}</Typography.Hint>}
               </div>
               <div css={{ display: 'flex', flexDirection: 'column', gap: theme.spacing.xs }}>
                 <Typography.Text color="secondary">{modelRowLabel}</Typography.Text>

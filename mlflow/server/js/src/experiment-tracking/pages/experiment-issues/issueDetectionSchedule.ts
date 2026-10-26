@@ -48,8 +48,29 @@ export interface IssueDetectionScheduleModel {
   secretId?: string;
 }
 
-/** The cadences offered. Hourly fires on the hour, daily at 09:00, weekly on Monday at 09:00. */
+/**
+ * The cadences offered. Hourly fires at the schedule's chosen minute past every hour; daily fires
+ * at its chosen time of day, weekly on Monday at that time.
+ */
 export type IssueDetectionScheduleFrequency = 'hourly' | 'daily' | 'weekly';
+
+/**
+ * Time of day a schedule fires when it stores none, `HH:MM` in its own timezone. This is the hour
+ * every schedule fired at before a start time could be chosen, so one saved before then reads back
+ * firing exactly when it already did. Must stay in step with `DEFAULT_FIRE_TIME` on the server.
+ */
+export const DEFAULT_ISSUE_DETECTION_START_TIME = '09:00';
+
+/**
+ * Minutes between the start times offered.
+ *
+ * The server's dispatcher polls on a 15-minute grid, so a schedule set to 09:08 cannot fire at
+ * 09:08 -- the earliest occurrence after it is 09:15. Offering quarter hours is what keeps what
+ * this control promises and what the server does the same thing. A time already stored off the
+ * grid is still shown and still fires (at the first poll after it) rather than being rounded
+ * behind its owner's back.
+ */
+export const START_TIME_STEP_MINUTES = 15;
 
 /** The user-facing schedule setting: no schedule, or one of the cadences. */
 export type IssueDetectionScheduleSetting = IssueDetectionScheduleFrequency | 'off';
@@ -70,6 +91,11 @@ export interface IssueDetectionSchedule {
   setting: IssueDetectionScheduleSetting;
   /** The cadence the schedule keeps while paused, so turning it back on restores it. */
   cadence: IssueDetectionScheduleFrequency | undefined;
+  /**
+   * Time of day the cadence fires, `HH:MM` in `timezone`. Always a readable time: a schedule
+   * storing none, or one storing a value this reader cannot use, reads back as the default.
+   */
+  startTime: string;
   traceFilters: ScheduleTraceFilter[];
   /** Undefined on a schedule saved before a model could be chosen: the server default applies. */
   model: IssueDetectionScheduleModel | undefined;
@@ -83,10 +109,49 @@ export interface IssueDetectionSchedule {
 export const noIssueDetectionSchedule = (): IssueDetectionSchedule => ({
   setting: 'off',
   cadence: undefined,
+  startTime: DEFAULT_ISSUE_DETECTION_START_TIME,
   traceFilters: [],
   model: undefined,
   timezone: undefined,
 });
+
+const pad = (value: number): string => String(value).padStart(2, '0');
+
+/** `HH:MM`, the form both this module and the server store and compare. */
+const formatStartTime = (hour: number, minute: number): string => `${pad(hour)}:${pad(minute)}`;
+
+/** The start times the modal offers: every `START_TIME_STEP_MINUTES` through one day. */
+export const issueDetectionStartTimeOptions = (): string[] =>
+  Array.from({ length: (24 * 60) / START_TIME_STEP_MINUTES }, (_, index) =>
+    formatStartTime(Math.floor((index * START_TIME_STEP_MINUTES) / 60), (index * START_TIME_STEP_MINUTES) % 60),
+  );
+
+// ASCII digits only, and the same hour/minute bounds the server applies. Both readers have to
+// agree: a value only one of them accepted would have the modal showing an hour the dispatcher
+// does not fire at.
+const START_TIME_PATTERN = /^(\d{1,2}):(\d{1,2})$/;
+
+/**
+ * The stored start time as `HH:MM`, or the default when it is missing or unreadable.
+ *
+ * Falling back costs the owner the hour they chose rather than every run, which is the same
+ * trade-off the server makes for the same tag.
+ */
+export const parseIssueDetectionStartTime = (raw: unknown): string => {
+  if (typeof raw !== 'string') {
+    return DEFAULT_ISSUE_DETECTION_START_TIME;
+  }
+  const match = START_TIME_PATTERN.exec(raw.trim());
+  if (!match) {
+    return DEFAULT_ISSUE_DETECTION_START_TIME;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) {
+    return DEFAULT_ISSUE_DETECTION_START_TIME;
+  }
+  return formatStartTime(hour, minute);
+};
 
 interface ExperimentTag {
   key: string;
@@ -182,6 +247,7 @@ export const readIssueDetectionScheduleFromTags = (
   return {
     setting: !cadence || paused ? 'off' : cadence,
     cadence,
+    startTime: parseIssueDetectionStartTime(parsed['fireTime']),
     traceFilters,
     model: parseScheduleModel(parsed['model']),
     timezone: typeof timezone === 'string' && timezone.trim().length > 0 ? timezone : undefined,
@@ -246,14 +312,20 @@ export const normalizeTraceFilters = (filters: ScheduleTraceFilter[]): ScheduleT
  * has none. Preserving it is what stops an edit made elsewhere moving when the schedule fires --
  * pausing a Tokyo daily schedule from Los Angeles would otherwise resume it at 09:00 Pacific.
  * There is no timezone control in the modal, so a stored zone is only ever changed by the server.
+ *
+ * Exported because the modal names this zone next to the start time it would save: a time of day
+ * says nothing on its own, and an owner editing a Tokyo schedule from Los Angeles has to be able
+ * to see which zone its 09:00 is.
  */
-const resolveTimezone = (stored?: string): string =>
+export const resolveScheduleTimezone = (stored?: string): string =>
   stored?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 export interface IssueDetectionScheduleUpdate {
   setting: IssueDetectionScheduleSetting;
   traceFilters: ScheduleTraceFilter[];
   model?: IssueDetectionScheduleModel;
+  /** Omitted keeps the stored start time, the way omitting the model keeps the stored model. */
+  startTime?: string;
 }
 
 /**
@@ -276,15 +348,18 @@ export interface IssueDetectionScheduleUpdate {
  */
 export const saveIssueDetectionSchedule = async (
   experimentId: string,
-  { setting, traceFilters, model }: IssueDetectionScheduleUpdate,
+  { setting, traceFilters, model, startTime }: IssueDetectionScheduleUpdate,
   current?: IssueDetectionSchedule,
 ): Promise<IssueDetectionSchedule> => {
   const normalized = normalizeTraceFilters(traceFilters);
   const cadence = setting === 'off' ? current?.cadence : setting;
-  // Like the cadence, the model and timezone are kept while paused so turning the schedule back
-  // on restores what it had.
+  // Like the cadence, the model, start time and timezone are kept while paused so turning the
+  // schedule back on restores what it had.
   const savedModel = model ?? current?.model;
-  const timezone = resolveTimezone(current?.timezone);
+  // Parsed on the way out as well as in, so a draft that somehow holds an unusable time stores
+  // the default rather than a value the dispatcher would read as one anyway.
+  const savedStartTime = parseIssueDetectionStartTime(startTime ?? current?.startTime);
+  const timezone = resolveScheduleTimezone(current?.timezone);
   await MlflowService.setExperimentTag({
     experiment_id: experimentId,
     key: MLFLOW_ISSUE_DETECTION_SCHEDULE_TRACE_FILTER_TAG,
@@ -298,8 +373,16 @@ export const saveIssueDetectionSchedule = async (
       cadence: cadence ?? null,
       timezone,
       paused: setting === 'off',
+      fireTime: savedStartTime,
       ...(savedModel ? { model: savedModel } : {}),
     }),
   });
-  return { setting, cadence, traceFilters: normalized, model: savedModel, timezone };
+  return {
+    setting,
+    cadence,
+    startTime: savedStartTime,
+    traceFilters: normalized,
+    model: savedModel,
+    timezone,
+  };
 };

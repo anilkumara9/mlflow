@@ -4707,6 +4707,10 @@
     "defaultMessage": "Add a filter",
     "description": "Idle evaluation runs search placeholder"
   },
+  "DcF3RJ": {
+    "defaultMessage": "Runs every day at {time} ({timezone}).",
+    "description": "Experiment issues tab > Schedule modal line stating when a daily scheduled run starts"
+  },
   "DcGPfO": {
     "defaultMessage": "Row height",
     "description": "Label for the row height radio group"
@@ -6935,6 +6939,10 @@
     "defaultMessage": "Provider",
     "description": "Dimension toggle option for provider"
   },
+  "L7jF8z": {
+    "defaultMessage": "Runs every Monday at {time} ({timezone}).",
+    "description": "Experiment issues tab > Schedule modal line stating when a weekly scheduled run starts"
+  },
   "L8czct": {
     "defaultMessage": "Latency Comparison",
     "description": "Title for the tool latency comparison chart"
@@ -7562,6 +7570,10 @@
   "N8xOwg": {
     "defaultMessage": "Search to find more users",
     "description": "Review queue: hint that more users are searchable for the owner"
+  },
+  "NAuuGy": {
+    "defaultMessage": "Start time",
+    "description": "Experiment issues tab > Schedule modal label for the time of day a run starts"
   },
   "NCOYl+": {
     "defaultMessage": "Remove chart context",

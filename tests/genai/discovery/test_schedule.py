@@ -9,6 +9,7 @@ from mlflow.entities.experiment import Experiment
 from mlflow.entities.experiment_tag import ExperimentTag
 from mlflow.genai.discovery.checkpoint import FIRST_RUN_LOOKBACK_MS, STALE_WATERMARK_CAP_MS
 from mlflow.genai.discovery.schedule import (
+    DEFAULT_FIRE_TIME,
     MAX_MODEL_IDENTIFIER_LENGTH,
     MAX_TRACE_FILTERS,
     SCHEDULE_VERSION,
@@ -64,6 +65,7 @@ def test_schedule_round_trips():
         cadence=DetectionCadence.WEEKLY,
         timezone="Asia/Tokyo",
         paused=True,
+        fire_time="18:45",
         trace_filters=(
             ScheduleTraceFilter(field="metadata", key="environment", value="production"),
             ScheduleTraceFilter(field="tag", key="team", value="search"),
@@ -86,6 +88,7 @@ def test_serialized_envelopes_match_the_stored_shape():
         "cadence": "daily",
         "timezone": "Europe/Berlin",
         "paused": False,
+        "fireTime": "09:00",
     }
     assert json.loads(schedule.trace_filters_to_json()) == [
         {"field": "metadata", "operator": "=", "key": "environment", "value": "production"}
@@ -398,6 +401,125 @@ def test_hourly_fires_on_the_local_hour_in_a_sub_hour_offset_zone():
     after = _ms("Asia/Kathmandu", 2026, 5, 4, 13, 37)
     fired = _local("Asia/Kathmandu", next_fire_time_ms(schedule, after))
     assert (fired.hour, fired.minute) == (14, 0)
+
+
+def test_a_schedule_storing_no_start_time_keeps_firing_when_it_always_did():
+    # The only compatibility property that matters here: a schedule saved before a start time
+    # could be chosen must read back as the 09:00 it was already firing at.
+    parsed = parse_detection_schedule(json.dumps({"version": SCHEDULE_VERSION, "cadence": "daily"}))
+    assert parsed.fire_time == DEFAULT_FIRE_TIME
+    fired = _local("UTC", next_fire_time_ms(parsed, _ms("UTC", 2026, 5, 4, 10)))
+    assert (fired.hour, fired.minute, fired.day) == (9, 0, 5)
+
+
+def test_daily_fires_at_the_chosen_time_in_the_schedule_timezone():
+    schedule = DetectionSchedule(
+        cadence=DetectionCadence.DAILY, timezone="Asia/Tokyo", fire_time="02:15"
+    )
+    fired = _local("Asia/Tokyo", next_fire_time_ms(schedule, _ms("Asia/Tokyo", 2026, 5, 4, 10)))
+    assert (fired.hour, fired.minute, fired.day) == (2, 15, 5)
+
+
+def test_daily_fires_later_today_when_the_chosen_time_has_not_passed():
+    schedule = DetectionSchedule(
+        cadence=DetectionCadence.DAILY, timezone="Asia/Tokyo", fire_time="23:30"
+    )
+    fired = _local("Asia/Tokyo", next_fire_time_ms(schedule, _ms("Asia/Tokyo", 2026, 5, 4, 10)))
+    assert (fired.hour, fired.minute, fired.day) == (23, 30, 4)
+
+
+def test_weekly_fires_monday_at_the_chosen_time():
+    schedule = DetectionSchedule(
+        cadence=DetectionCadence.WEEKLY, timezone="Europe/Berlin", fire_time="17:45"
+    )
+    # 2026-05-06 is a Wednesday, so the next Monday is the 11th.
+    fired = _local("Europe/Berlin", next_fire_time_ms(schedule, _ms("Europe/Berlin", 2026, 5, 6)))
+    assert (fired.weekday(), fired.hour, fired.minute, fired.day) == (0, 17, 45, 11)
+
+
+def test_the_chosen_time_keeps_its_local_clock_across_a_spring_forward():
+    schedule = DetectionSchedule(
+        cadence=DetectionCadence.DAILY, timezone="America/New_York", fire_time="04:30"
+    )
+    # US clocks go forward on 2026-03-08, two hours before this fires.
+    fired = _local(
+        "America/New_York", next_fire_time_ms(schedule, _ms("America/New_York", 2026, 3, 7, 10))
+    )
+    assert (fired.day, fired.hour, fired.minute) == (8, 4, 30)
+    assert fired.utcoffset().total_seconds() == -4 * 3600
+
+
+def test_a_chosen_time_inside_the_hour_a_spring_forward_skips_fires_once_it_exists():
+    # 02:30 does not happen on 2026-03-08 in New York: the clocks jump 02:00 -> 03:00. The
+    # occurrence has to land somewhere rather than be skipped, and zoneinfo moves it by the gap.
+    schedule = DetectionSchedule(
+        cadence=DetectionCadence.DAILY, timezone="America/New_York", fire_time="02:30"
+    )
+    fired = _local(
+        "America/New_York", next_fire_time_ms(schedule, _ms("America/New_York", 2026, 3, 7, 10))
+    )
+    assert (fired.day, fired.hour, fired.minute) == (8, 3, 30)
+
+
+def test_hourly_fires_at_the_chosen_minute_past_every_hour():
+    # The hour a start time names says nothing about an hourly cadence, so only its minute applies.
+    schedule = DetectionSchedule(cadence=DetectionCadence.HOURLY, fire_time="09:45")
+    assert next_fire_time_ms(schedule, _ms("UTC", 2026, 5, 4, 13, 37)) == _ms(
+        "UTC", 2026, 5, 4, 13, 45
+    )
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "",
+        "9",
+        "09:60",
+        "24:00",
+        "-1:30",
+        "09:0a",
+        "nine",
+        "09:00:00",
+        "²:00",
+        # Readable as 02:00 by ``int``, but the modal's reader takes ASCII digits only, so
+        # accepting it here would show one hour in the dialog and fire at another.
+        "٢:٠٠",
+        900,
+        None,
+    ],
+)
+def test_an_unreadable_start_time_falls_back_to_the_default(stored: object):
+    # A time this server cannot read costs the owner the hour they chose, not every run. Parsed
+    # from the tag rather than constructed, since the tag is client-written.
+    parsed = parse_detection_schedule(
+        json.dumps({"version": SCHEDULE_VERSION, "cadence": "daily", "fireTime": stored})
+    )
+    assert parsed.fire_time == DEFAULT_FIRE_TIME
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("9:5", "09:05"),
+        (" 09:15 ", "09:15"),
+        ("00:00", "00:00"),
+    ],
+)
+def test_a_readable_start_time_is_normalized(stored: str, expected: str):
+    parsed = parse_detection_schedule(
+        json.dumps({"version": SCHEDULE_VERSION, "cadence": "daily", "fireTime": stored})
+    )
+    assert parsed.fire_time == expected
+
+
+def test_a_start_time_off_the_poll_grid_is_kept_rather_than_rounded():
+    # The modal offers quarter hours, but a tag can name any minute. Keeping it is what makes an
+    # off-grid time fire at the first poll after it (09:15 here) instead of a quarter hour early.
+    parsed = parse_detection_schedule(
+        json.dumps({"version": SCHEDULE_VERSION, "cadence": "daily", "fireTime": "09:08"})
+    )
+    assert parsed.fire_time == "09:08"
+    assert next_fire_time_ms(parsed, _ms("UTC", 2026, 5, 4, 8)) == _ms("UTC", 2026, 5, 4, 9, 8)
 
 
 def test_a_schedule_the_server_has_not_seen_is_not_due_yet():
