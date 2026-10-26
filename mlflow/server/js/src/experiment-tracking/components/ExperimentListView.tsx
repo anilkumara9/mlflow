@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Interpolation, Theme } from '@emotion/react';
 import {
   BeakerIcon,
@@ -59,7 +59,13 @@ export const ExperimentListView = () => {
   });
 
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  const [searchInput, setSearchInput] = useState('');
+  const [searchInput, setSearchInput] = useState(searchFilter);
+
+  // Keep the search box in sync with the filter stored in the URL, so a
+  // bookmarked or shared link (or back/forward navigation) populates it.
+  useEffect(() => {
+    setSearchInput(searchFilter);
+  }, [searchFilter]);
   const [showCreateExperimentModal, setShowCreateExperimentModal] = useState(false);
   const [showBulkDeleteExperimentModal, setShowBulkDeleteExperimentModal] = useState(false);
 
@@ -72,6 +78,7 @@ export const ExperimentListView = () => {
   };
 
   const handleSearchClear = () => {
+    setSearchInput('');
     setSearchFilter('');
   };
 
@@ -190,7 +197,7 @@ export const ExperimentListView = () => {
               description: 'Placeholder text inside experiments search bar',
             })}
             componentId="mlflow.experiment_list_view.search"
-            defaultValue={searchFilter}
+            value={searchInput}
             onChange={handleSearchInputChange}
             onSubmit={handleSearchSubmit}
             onClear={handleSearchClear}

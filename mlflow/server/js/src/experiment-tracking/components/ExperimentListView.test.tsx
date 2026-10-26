@@ -1,7 +1,7 @@
 import { jest, test, expect } from '@jest/globals';
 import userEvent from '@testing-library/user-event';
 import { screen, renderWithIntl, waitFor } from '../../common/utils/TestUtils.react18';
-import { BrowserRouter } from '../../common/utils/RoutingUtils';
+import { BrowserRouter, MemoryRouter } from '../../common/utils/RoutingUtils';
 import { Provider } from 'react-redux';
 import thunk from 'redux-thunk';
 import configureStore from 'redux-mock-store';
@@ -26,7 +26,12 @@ jest.mock('./experiment-page/hooks/useTagsFilter', () => ({
   useTagsFilter: jest.fn(),
 }));
 
-const mountComponent = (props: { experiments: any[]; tagsFilter?: any[]; filterBySearch?: boolean }) => {
+const mountComponent = (props: {
+  experiments: any[];
+  tagsFilter?: any[];
+  filterBySearch?: boolean;
+  initialUrl?: string;
+}) => {
   const mockStore = configureStore([thunk, promiseMiddleware()]);
 
   jest.mocked(useExperimentListQuery).mockImplementation((params) => ({
@@ -72,9 +77,15 @@ const mountComponent = (props: { experiments: any[]; tagsFilter?: any[]; filterB
           },
         })}
       >
-        <BrowserRouter>
-          <ExperimentListView />
-        </BrowserRouter>
+        {props.initialUrl ? (
+          <MemoryRouter initialEntries={[props.initialUrl]}>
+            <ExperimentListView />
+          </MemoryRouter>
+        ) : (
+          <BrowserRouter>
+            <ExperimentListView />
+          </BrowserRouter>
+        )}
       </Provider>
     </DesignSystemProvider>,
   );
@@ -137,6 +148,38 @@ test('Tag filter button shows no count when no filters are applied', () => {
   const tagButton = screen.getByRole('button', { name: /^Tag$/ });
   expect(tagButton).toBeInTheDocument();
   expect(tagButton).not.toHaveTextContent('·');
+});
+
+test('populates the search box from the experimentSearchFilter URL param and filters the list', async () => {
+  mountComponent({
+    experiments: [
+      Fixtures.createExperiment({ experimentId: '1', name: 'alpha-exp' }),
+      Fixtures.createExperiment({ experimentId: '2', name: 'beta-exp' }),
+    ],
+    filterBySearch: true,
+    initialUrl: '/?experimentSearchFilter=alpha',
+  });
+
+  expect(screen.getByTestId('search-experiment-input')).toHaveValue('alpha');
+  expect(await screen.findByText('alpha-exp')).toBeInTheDocument();
+  expect(screen.queryByText('beta-exp')).not.toBeInTheDocument();
+});
+
+test('submitting without editing does not clear a filter populated from the URL', async () => {
+  mountComponent({
+    experiments: [
+      Fixtures.createExperiment({ experimentId: '1', name: 'alpha-exp' }),
+      Fixtures.createExperiment({ experimentId: '2', name: 'beta-exp' }),
+    ],
+    filterBySearch: true,
+    initialUrl: '/?experimentSearchFilter=alpha',
+  });
+
+  await userEvent.type(screen.getByTestId('search-experiment-input'), '{Enter}');
+
+  expect(screen.getByTestId('search-experiment-input')).toHaveValue('alpha');
+  expect(await screen.findByText('alpha-exp')).toBeInTheDocument();
+  expect(screen.queryByText('beta-exp')).not.toBeInTheDocument();
 });
 
 test('Delete button is disabled when checked experiments are hidden by the search filter', async () => {
