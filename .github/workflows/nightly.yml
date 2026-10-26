@@ -1,0 +1,227 @@
+name: Nightly
+
+on:
+  push:
+    branches:
+      - codex/nightly-dry-run
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview nightly issues without publishing or changing state"
+        required: false
+        type: boolean
+        default: true
+      workflow:
+        description: "Source workflow filename; leave empty to analyze all configured workflows"
+        required: false
+        type: string
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+cache-mode: none
+
+jobs:
+  register:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-slim
+    timeout-minutes: 2
+    steps:
+      - run: echo 'Register Nightly for manual dry runs'
+
+  collect:
+    if: >-
+      github.repository == 'mlflow/mlflow' &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+       (github.event_name == 'workflow_dispatch' && inputs.dry_run))
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    outputs:
+      context_artifact: ${{ steps.upload.outputs.artifact-id }}
+      has_failures: ${{ steps.collect.outputs.has_failures }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+      - name: Collect scheduled failures and issue history
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_WORKFLOW: ${{ inputs.workflow }}
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          args=()
+          if [ -n "$SOURCE_WORKFLOW" ]; then
+            args+=(--workflow "$SOURCE_WORKFLOW")
+          fi
+          uv run --directory .claude/skills --package skills skills nightly collect --out-dir /tmp/nightly-context "${args[@]}"
+          has_failures=$(jq -r '[.runs[].jobs[]] | length > 0' /tmp/nightly-context/inventory.json)
+          echo "has_failures=$has_failures" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: nightly-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/nightly-context/inventory.json
+            /tmp/nightly-context/issues.json
+            /tmp/nightly-context/state.json
+          if-no-files-found: error
+          retention-days: 7
+
+  analyze:
+    needs: collect
+    if: >-
+      github.repository == 'mlflow/mlflow' &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+       (github.event_name == 'workflow_dispatch' && inputs.dry_run)) &&
+      needs.collect.outputs.has_failures == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+    outputs:
+      report_artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.collect.outputs.context_artifact }}
+          path: /tmp/nightly-context
+          merge-multiple: true
+      - uses: ./.github/actions/setup-python
+      - uses: ./.github/actions/setup-claude
+      - name: Prepare analysis dependencies and source revisions
+        run: |
+          uv sync --package skills
+          jq -r '.runs[].head_sha' /tmp/nightly-context/inventory.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
+          while IFS= read -r source_sha; do
+            [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            if ! git cat-file -e "$source_sha^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$source_sha"
+            fi
+          done < "$RUNNER_TEMP/nightly-source-shas.txt"
+      - uses: ./.github/actions/setup-gateway
+        id: gateway
+        with:
+          task: nightly
+          host: ${{ secrets.DATABRICKS_HOST }}
+          client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      - name: Analyze failures in isolated worktrees
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATEWAY_TOKEN: ${{ steps.gateway.outputs.token }}
+          GATEWAY_URL: ${{ steps.gateway.outputs.base-url }}
+          ANTHROPIC_CUSTOM_HEADERS: ${{ steps.gateway.outputs.custom-headers }}
+        run: |
+          cp .claude/scripts/run-nightly.sh "$RUNNER_TEMP/run-nightly.sh"
+          bash "$RUNNER_TEMP/run-nightly.sh"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        if: always()
+        with:
+          name: nightly-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nightly-report/report.json
+            ${{ runner.temp }}/nightly-report/stream.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+  execute:
+    needs: [collect, analyze]
+    if: >-
+      always() && github.repository == 'mlflow/mlflow' &&
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
+       (github.event_name == 'workflow_dispatch' && inputs.dry_run)) &&
+      needs.collect.result == 'success' &&
+      (needs.analyze.result == 'success' || needs.analyze.result == 'skipped')
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+      # Download the original collector artifact, never a context supplied by the agent.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.collect.outputs.context_artifact }}
+          path: /tmp/nightly-context
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.collect.outputs.has_failures == 'true'
+        with:
+          artifact-ids: ${{ needs.analyze.outputs.report_artifact }}
+          path: /tmp/nightly-report
+          merge-multiple: true
+      - name: Prepare an empty report when no failed jobs need analysis
+        if: needs.collect.outputs.has_failures != 'true'
+        run: |
+          mkdir -p /tmp/nightly-report
+          echo '{"groups": []}' > /tmp/nightly-report/report.json
+      - name: Validate and publish nightly issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLY: ${{ github.event_name == 'schedule' || !inputs.dry_run }}
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          args=()
+          if [ "$APPLY" = true ]; then
+            args+=(--apply)
+          fi
+          timeout 7m uv run --directory .claude/skills --package skills skills nightly post-check \
+            --inventory /tmp/nightly-context/inventory.json \
+            --issues /tmp/nightly-context/issues.json \
+            --report /tmp/nightly-report/report.json \
+            --state /tmp/nightly-context/state.json \
+            --plan /tmp/nightly-plan.json "${args[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: nightly-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/nightly-plan.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Check for durable live state
+        id: state
+        if: always() && (github.event_name == 'schedule' || !inputs.dry_run)
+        run: |
+          if [ -f /tmp/nightly-context/state.json ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && steps.state.outputs.exists == 'true'
+        with:
+          name: nightly-state
+          path: /tmp/nightly-context/state.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90
