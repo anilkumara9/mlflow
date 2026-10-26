@@ -60,7 +60,13 @@ time to reconcile, cover uninvestigated groups as `uncertain`, and validate the 
 ## Delegate investigation
 
 Launch one general-purpose investigator per remaining issue group, explicitly requesting
-worktree isolation. Prefer parallel foreground `Agent` calls, keeping at most three
+worktree isolation. Use the `Agent` tool (called `Task` in some sessions). This step is
+mandatory: the coordinator's own log reading does not replace an investigation. Do not
+write a `new` finding before a worker has inspected the tested source in its isolated
+worktree and returned a completed result. If a worker cannot be launched or completed,
+use `uncertain` and explain the missing investigation.
+
+Prefer parallel foreground investigator calls, keeping at most three
 investigators active; wait for a task to finish before launching the next queued group.
 Do not depend on additional background-task tools or bundle independent groups into
 one task. Respect the shared time budget when deciding whether to launch another group.
@@ -94,7 +100,8 @@ and do not rule out a component merely because the traceback ends in another pac
 A confirmed failure can be `new` while its exact trigger remains unknown. Choose one
 final verdict:
 
-- `new`: evidence supports a distinct problem with no matching open `nightly` issue.
+- `new`: a completed isolated investigation supports a distinct problem with no
+  matching open `nightly` issue.
   Supply a concise `title` and Markdown `body` describing the symptoms, affected scope,
   tested source SHAs, attempt-pinned job links, evidence, and remaining uncertainties.
 - `already_reported`: evidence supports the same cause as an open `nightly` issue.
