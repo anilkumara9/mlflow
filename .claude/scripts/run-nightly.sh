@@ -9,7 +9,8 @@ set -euo pipefail
 
 context_dir=/tmp/nightly-context
 out_dir=/tmp/nightly-out
-stage_dir="$RUNNER_TEMP/nightly-report"
+trusted_bundle="$RUNNER_TEMP/nightly-bundle"
+stage_dir="$trusted_bundle/report"
 sandbox_settings="$RUNNER_TEMP/nightly-srt.json"
 proxy_log="$RUNNER_TEMP/nightly-gateway-proxy.log"
 source_sha=$(git rev-parse HEAD)
@@ -37,6 +38,10 @@ echo "::stop-commands::$command_token"
 trap cleanup EXIT
 
 mkdir -p "$stage_dir" "$out_dir" ~/.claude ~/.cache/uv ~/.npm
+if [ ! -d "$trusted_bundle/context" ]; then
+  echo 'Nightly collector snapshot was not staged before analysis' >&2
+  exit 1
+fi
 echo '{}' > ~/.claude.json
 printf '%s\n%s\n' "$GATEWAY_TOKEN" "$proxy_token" | env -u GATEWAY_TOKEN -u GH_TOKEN \
   GATEWAY_URL="$GATEWAY_URL" node .claude/sandbox/gateway-proxy.mjs > "$proxy_log" 2>&1 &
@@ -53,7 +58,8 @@ curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz > /dev/null
 
 # analyze-ci follows GitHub's signed log-storage redirects.
 gh api meta > "$RUNNER_TEMP/nightly-github-meta.json"
-jq --exit-status --slurpfile meta "$RUNNER_TEMP/nightly-github-meta.json" '
+jq --exit-status --arg trusted_bundle "$trusted_bundle" \
+  --slurpfile meta "$RUNNER_TEMP/nightly-github-meta.json" '
   ($meta[0].domains.actions
     | if type == "array" then . else error("Invalid Actions domains in GitHub /meta") end
     | map(select(test("^productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net$")))
@@ -63,6 +69,7 @@ jq --exit-status --slurpfile meta "$RUNNER_TEMP/nightly-github-meta.json" '
     else
       .network.allowedDomains += ($domains | map(. + ":443"))
     end
+  | .filesystem.denyWrite += [$trusted_bundle]
 ' .claude/sandbox/srt.json > "$sandbox_settings"
 
 srt --settings "$sandbox_settings" -- true
@@ -100,6 +107,15 @@ for command in \
     exit 1
   fi
 done
+
+probe="$trusted_bundle/.sandbox-write-probe"
+touch "$probe"
+rm "$probe"
+if srt --settings "$sandbox_settings" -- touch "$probe" || [ -e "$probe" ]; then
+  rm -f "$probe"
+  echo 'Sandbox allowed writes to the trusted Nightly bundle' >&2
+  exit 1
+fi
 
 export ANTHROPIC_BASE_URL=http://localhost:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN="$proxy_token"

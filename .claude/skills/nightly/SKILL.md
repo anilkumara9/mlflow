@@ -38,6 +38,8 @@ time to reconcile, cover uninvestigated groups as `uncertain`, and validate the 
    Preserve raw-log paths for deeper inspection; do not fetch the same logs again or
    independently compare snapshots. Missing diagnostic evidence must become an
    uncertainty, not a guessed cause.
+   Preserve the complete fetched job metadata and read the full issue snapshot; do not
+   truncate these inputs before grouping or duplicate matching.
 2. Filter obvious transient failures only when every affected job's source run has
    `retry_available: true`. The logs must support a short-lived runner or network
    interruption; an unexplained timeout, dependency conflict, import error, or failed
@@ -74,6 +76,9 @@ the correct SHA is unavailable, retain the affected group as uncertain.
 Ask workers for findings, supporting evidence, and uncertainties only. They must identify
 which jobs each finding explains and report the source SHA inspected. They must not
 choose verdicts, draft issues, fetch logs again, run tests, make fixes, or write to GitHub.
+For claims about dependency resolution or process environments, have workers inspect
+the relevant environment creation, installation, and propagation code. Different package
+versions alone do not prove that a constraint or environment variable was ignored.
 No dedicated agent definition is needed.
 
 ## Reconcile and write
@@ -83,7 +88,11 @@ A launch acknowledgement or progress message is not completion; use `uncertain` 
 uninvestigated groups or an incomplete investigation. Verify checkout SHAs and reconcile
 findings across groups: merge symptoms explained by the same cause,
 split unrelated causes, and check candidate issues again against the combined evidence.
-Keep each job's run/source-SHA association in the evidence. Choose one final verdict:
+Keep each job's run/source-SHA association in the evidence. Check every causal claim
+against the findings: record unverified mechanisms as hypotheses in `uncertainties`,
+and do not rule out a component merely because the traceback ends in another package.
+A confirmed failure can be `new` while its exact trigger remains unknown. Choose one
+final verdict:
 
 - `new`: evidence supports a distinct problem with no matching open `nightly` issue.
   Supply a concise `title` and Markdown `body` describing the symptoms, affected scope,

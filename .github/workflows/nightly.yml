@@ -27,20 +27,19 @@ permissions: {}
 cache-mode: none
 
 jobs:
-  collect:
+  analyze:
     if: >-
       github.repository == 'mlflow/mlflow' &&
       (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
        (github.event_name == 'workflow_dispatch' && inputs.dry_run))
-    runs-on: ubuntu-slim
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: read
       issues: read
     outputs:
-      context_artifact: ${{ steps.upload.outputs.artifact-id }}
-      has_failures: ${{ steps.collect.outputs.has_failures }}
+      bundle_artifact: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,45 +62,14 @@ jobs:
           uv run --directory .claude/skills --package skills skills nightly collect --out-dir /tmp/nightly-context "${args[@]}"
           has_failures=$(jq -r '[.runs[].jobs[]] | length > 0' /tmp/nightly-context/inventory.json)
           echo "has_failures=$has_failures" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        id: upload
-        with:
-          name: nightly-context-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            /tmp/nightly-context/inventory.json
-            /tmp/nightly-context/issues.json
-            /tmp/nightly-context/state.json
-          if-no-files-found: error
-          retention-days: 7
-
-  analyze:
-    needs: collect
-    if: >-
-      github.repository == 'mlflow/mlflow' &&
-      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
-       (github.event_name == 'workflow_dispatch' && inputs.dry_run)) &&
-      needs.collect.outputs.has_failures == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      actions: read
-      contents: read
-      issues: read
-    outputs:
-      report_artifact: ${{ steps.upload.outputs.artifact-id }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          artifact-ids: ${{ needs.collect.outputs.context_artifact }}
-          path: /tmp/nightly-context
-          merge-multiple: true
-      - uses: ./.github/actions/setup-python
+      - name: Preserve original inputs outside the agent's writable paths
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-bundle/context"
+          cp /tmp/nightly-context/{inventory,issues,state}.json "$RUNNER_TEMP/nightly-bundle/context/"
       - uses: ./.github/actions/setup-claude
+        if: steps.collect.outputs.has_failures == 'true'
       - name: Prepare analysis dependencies and source revisions
+        if: steps.collect.outputs.has_failures == 'true'
         run: |
           uv sync --package skills
           jq -r '.runs[].head_sha' /tmp/nightly-context/inventory.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
@@ -113,12 +81,14 @@ jobs:
           done < "$RUNNER_TEMP/nightly-source-shas.txt"
       - uses: ./.github/actions/setup-gateway
         id: gateway
+        if: steps.collect.outputs.has_failures == 'true'
         with:
           task: nightly
           host: ${{ secrets.DATABRICKS_HOST }}
           client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
           client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       - name: Analyze failures in isolated worktrees
+        if: steps.collect.outputs.has_failures == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GATEWAY_TOKEN: ${{ steps.gateway.outputs.token }}
@@ -127,25 +97,27 @@ jobs:
         run: |
           cp .claude/scripts/run-nightly.sh "$RUNNER_TEMP/run-nightly.sh"
           bash "$RUNNER_TEMP/run-nightly.sh"
+      - name: Prepare an empty report when no failed jobs need analysis
+        if: steps.collect.outputs.has_failures != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/nightly-bundle/report"
+          echo '{"groups": []}' > "$RUNNER_TEMP/nightly-bundle/report/report.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         if: always()
         with:
-          name: nightly-report-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/nightly-report/report.json
-            ${{ runner.temp }}/nightly-report/stream.jsonl
+          name: nightly-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nightly-bundle
           if-no-files-found: error
           retention-days: 7
 
   execute:
-    needs: [collect, analyze]
+    needs: analyze
     if: >-
       always() && github.repository == 'mlflow/mlflow' &&
       (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
        (github.event_name == 'workflow_dispatch' && inputs.dry_run)) &&
-      needs.collect.result == 'success' &&
-      (needs.analyze.result == 'success' || needs.analyze.result == 'skipped')
+      needs.analyze.result == 'success'
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
@@ -158,24 +130,13 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: ./.github/actions/setup-python
-      # Download the original collector artifact, never a context supplied by the agent.
+      # The bundle contains the host-preserved original inputs and the agent's report.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          artifact-ids: ${{ needs.collect.outputs.context_artifact }}
-          path: /tmp/nightly-context
+          artifact-ids: ${{ needs.analyze.outputs.bundle_artifact }}
+          path: /tmp/nightly-bundle
           merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.collect.outputs.has_failures == 'true'
-        with:
-          artifact-ids: ${{ needs.analyze.outputs.report_artifact }}
-          path: /tmp/nightly-report
-          merge-multiple: true
-      - name: Prepare an empty report when no failed jobs need analysis
-        if: needs.collect.outputs.has_failures != 'true'
-        run: |
-          mkdir -p /tmp/nightly-report
-          echo '{"groups": []}' > /tmp/nightly-report/report.json
-      - name: Validate and publish nightly issues
+      - name: Validate nightly findings and build the execution plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLY: ${{ github.event_name == 'schedule' || !inputs.dry_run }}
@@ -188,10 +149,10 @@ jobs:
             args+=(--apply)
           fi
           timeout 7m uv run --directory .claude/skills --package skills skills nightly post-check \
-            --inventory /tmp/nightly-context/inventory.json \
-            --issues /tmp/nightly-context/issues.json \
-            --report /tmp/nightly-report/report.json \
-            --state /tmp/nightly-context/state.json \
+            --inventory /tmp/nightly-bundle/context/inventory.json \
+            --issues /tmp/nightly-bundle/context/issues.json \
+            --report /tmp/nightly-bundle/report/report.json \
+            --state /tmp/nightly-bundle/context/state.json \
             --plan /tmp/nightly-plan.json "${args[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -204,14 +165,14 @@ jobs:
         id: state
         if: always() && (github.event_name == 'schedule' || !inputs.dry_run)
         run: |
-          if [ -f /tmp/nightly-context/state.json ]; then
+          if [ -f /tmp/nightly-bundle/context/state.json ]; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.state.outputs.exists == 'true'
         with:
           name: nightly-state
-          path: /tmp/nightly-context/state.json
+          path: /tmp/nightly-bundle/context/state.json
           if-no-files-found: error
           overwrite: true
           retention-days: 90
