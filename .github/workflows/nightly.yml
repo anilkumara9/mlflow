@@ -1,9 +1,6 @@
 name: Nightly
 
 on:
-  push:
-    branches:
-      - codex/nightly-dry-run
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -30,13 +27,6 @@ permissions: {}
 cache-mode: none
 
 jobs:
-  register:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-slim
-    timeout-minutes: 2
-    steps:
-      - run: echo 'Register Nightly for manual dry runs'
-
   collect:
     if: >-
       github.repository == 'mlflow/mlflow' &&
