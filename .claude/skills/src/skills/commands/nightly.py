@@ -77,7 +77,7 @@ def restore_state(default_branch: str) -> dict[str, Any]:
             check=True,
         )
         with zipfile.ZipFile(io.BytesIO(result.stdout)) as archive:
-            state = json.loads(archive.read("state.json"))
+            state = json.loads(archive.read("snapshot.json"))
         if (
             not isinstance(state, dict)
             or set(state) != {"processed", "issues", "reruns"}
@@ -204,7 +204,7 @@ def collect(out_dir: Path, workflow: str | None = None) -> None:
         runs.append(run)
     write_json(out_dir / "inventory.json", {"repository": REPOSITORY, "runs": runs})
     write_json(out_dir / "issues.json", load_issues())
-    write_json(out_dir / "state.json", state)
+    write_json(out_dir / "snapshot.json", state)
 
 
 def nightly_issue(issue: dict[str, Any]) -> bool:
