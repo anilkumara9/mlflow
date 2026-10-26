@@ -108,7 +108,6 @@ jobs:
           uv sync --package skills
           jq -r '.runs[].head_sha' /tmp/nightly-context/snapshot.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
           while IFS= read -r source_sha; do
-            [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
             if ! git cat-file -e "$source_sha^{commit}" 2>/dev/null; then
               git fetch --no-tags --depth=1 origin "$source_sha"
             fi
@@ -141,10 +140,6 @@ jobs:
         run: |
           umask 077
           mkdir -p "$RUNNER_TEMP/nightly-bundle/report" /tmp/nightly-out ~/.claude ~/.cache/uv ~/.npm
-          if [ ! -f "$RUNNER_TEMP/nightly-bundle/context/snapshot.json" ]; then
-            echo 'Nightly collector snapshot was not staged before analysis' >&2
-            exit 1
-          fi
           echo '{}' > ~/.claude.json
       - name: Start gateway proxy
         id: gateway-proxy

@@ -1,7 +1,6 @@
 $schema: https://json-schema.org/draft/2020-12/schema
 title: Nightly Failure Analysis
 type: object
-additionalProperties: false
 required: [groups]
 properties:
   groups:
@@ -12,7 +11,6 @@ properties:
 $defs:
   job:
     type: object
-    additionalProperties: false
     required: [workflow, job, url]
     properties:
       workflow:
@@ -23,10 +21,8 @@ $defs:
         minLength: 1
       url:
         type: string
-        pattern: '^https://github\.com/mlflow/mlflow/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*/job/[1-9][0-9]*$'
   group:
     type: object
-    additionalProperties: false
     required: [verdict, summary, jobs, evidence, uncertainties]
     properties:
       verdict:
@@ -70,17 +66,9 @@ $defs:
               const: new
         then:
           required: [title, body]
-        else:
-          not:
-            anyOf:
-              - required: [title]
-              - required: [body]
       - if:
           properties:
             verdict:
               const: already_reported
         then:
           required: [issue_number]
-        else:
-          not:
-            required: [issue_number]

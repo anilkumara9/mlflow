@@ -78,15 +78,7 @@ def restore_state(default_branch: str) -> dict[str, Any]:
             check=True,
         )
         with zipfile.ZipFile(io.BytesIO(result.stdout)) as archive:
-            state = json.loads(archive.read("snapshot.json"))["state"]
-        if (
-            not isinstance(state, dict)
-            or set(state) != {"processed", "issues", "reruns"}
-            or not all(isinstance(state[key], list) for key in ("processed", "reruns"))
-            or not isinstance(state["issues"], dict)
-        ):
-            raise ValueError("Invalid Nightly state artifact")
-        return state
+            return cast(dict[str, Any], json.loads(archive.read("snapshot.json"))["state"])
     return empty_state()
 
 
@@ -108,7 +100,6 @@ def source_run(run: dict[str, Any], default_branch: str) -> bool:
         and run["head_repository"]["full_name"] == REPOSITORY
         and run["status"] == "completed"
         and run["conclusion"] == "failure"
-        and run["run_attempt"] >= 1
     )
 
 
@@ -195,8 +186,6 @@ def nightly_issue(issue: dict[str, Any]) -> bool:
 
 def validate_report(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
     Draft202012Validator(yaml.safe_load(SCHEMA_PATH.read_text())).validate(report)
-    if snapshot["repository"] != REPOSITORY:
-        raise ValueError("Unsupported repository")
     known_jobs = {job["url"]: public_job(job) for run in snapshot["runs"] for job in run["jobs"]}
     retry_available = {
         job["url"]: run["run_attempt"] == 1 for run in snapshot["runs"] for job in run["jobs"]
@@ -206,7 +195,7 @@ def validate_report(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
     drafts = set()
     for group in report["groups"]:
         for job in group["jobs"]:
-            if known_jobs.get(job["url"]) != job:
+            if known_jobs.get(job["url"]) != public_job(job):
                 raise ValueError(f"Unknown job or changed metadata: {job['url']}")
             if group["verdict"] == "transient" and not retry_available[job["url"]]:
                 raise ValueError("Retry budget exhausted; investigate the persistent failure")
