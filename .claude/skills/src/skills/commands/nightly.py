@@ -16,7 +16,6 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 REPOSITORY = "mlflow/mlflow"
 # TODO: Support additional nightly workflows.
 SOURCE_WORKFLOW = "cross-version-tests.yml"
-SOURCE_NAME = "Cross version tests"
 NIGHTLY_WORKFLOW = ".github/workflows/nightly.yml"
 SCHEMA_PATH = Path(__file__).parents[3] / "nightly" / "output.schema.yaml"
 FAILED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
@@ -104,7 +103,6 @@ def load_issues(*, state: str = "open") -> list[dict[str, Any]]:
 def source_run(run: dict[str, Any], default_branch: str) -> bool:
     return bool(
         run["path"].split("@")[0] == f".github/workflows/{SOURCE_WORKFLOW}"
-        and run["name"] == SOURCE_NAME
         and run["event"] == "schedule"
         and run["head_branch"] == default_branch
         and run["head_repository"]["full_name"] == REPOSITORY

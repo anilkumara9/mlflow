@@ -8,7 +8,7 @@ arguments: [snapshot_path, out_dir]
 # Nightly failure coordinator
 
 Read `$snapshot_path`: the trusted snapshot of `repository`, `runs`, open `issues`,
-and processing `state`. Analyze only its supplied `Cross version tests` jobs. Each
+and processing `state`. Analyze only its supplied cross-version test jobs. Each
 run provides the tested `head_sha` and `retry_available`; each job has `workflow`,
 `job`, and an attempt-pinned `url`. The collector already excludes processed runs.
 
