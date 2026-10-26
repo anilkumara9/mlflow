@@ -87,21 +87,192 @@ jobs:
           host: ${{ secrets.DATABRICKS_HOST }}
           client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
           client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      - name: Prepare sandbox paths
+        if: steps.collect.outputs.has_failures == 'true'
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/nightly-bundle/report" /tmp/nightly-out ~/.claude ~/.cache/uv ~/.npm
+          if [ ! -f "$RUNNER_TEMP/nightly-bundle/context/snapshot.json" ]; then
+            echo 'Nightly collector snapshot was not staged before analysis' >&2
+            exit 1
+          fi
+          echo '{}' > ~/.claude.json
+          cp .claude/scripts/validate-nightly-output.py "$RUNNER_TEMP/validate-nightly-output.py"
+      - name: Start gateway proxy
+        id: gateway-proxy
+        if: steps.collect.outputs.has_failures == 'true'
+        env:
+          GATEWAY_TOKEN: ${{ steps.gateway.outputs.token }}
+          GATEWAY_URL: ${{ steps.gateway.outputs.base-url }}
+        run: |
+          umask 077
+          proxy_token=$(openssl rand -hex 32)
+          echo "::add-mask::$proxy_token"
+          printf 'token=%s\n' "$proxy_token" >> "$GITHUB_OUTPUT"
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          printf '%s\n%s\n' "$GATEWAY_TOKEN" "$proxy_token" | env -u GATEWAY_TOKEN -u GH_TOKEN \
+            GATEWAY_URL="$GATEWAY_URL" node .claude/sandbox/gateway-proxy.mjs \
+            > "$RUNNER_TEMP/nightly-gateway-proxy.log" 2>&1 &
+          proxy_pid=$!
+          printf '%s\n' "$proxy_pid" > "$RUNNER_TEMP/nightly-gateway-proxy.pid"
+          unset GATEWAY_TOKEN proxy_token
+          for _ in $(seq 1 30); do
+            kill -0 "$proxy_pid" 2>/dev/null || break
+            if curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz > /dev/null
+      - name: Configure sandbox log access
+        if: steps.collect.outputs.has_failures == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          # analyze-ci follows GitHub's signed log-storage redirects.
+          gh api meta > "$RUNNER_TEMP/nightly-github-meta.json"
+          jq --exit-status --arg trusted_bundle "$RUNNER_TEMP/nightly-bundle" \
+            --slurpfile meta "$RUNNER_TEMP/nightly-github-meta.json" '
+            ($meta[0].domains.actions
+              | if type == "array" then . else error("Invalid Actions domains in GitHub /meta") end
+              | map(select(test("^productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net$")))
+              | unique) as $domains
+            | if ($domains | length) == 0 then
+                error("GitHub /meta returned no Actions log-storage domains")
+              else
+                .network.allowedDomains += ($domains | map(. + ":443"))
+              end
+            | .filesystem.denyWrite += [$trusted_bundle]
+          ' .claude/sandbox/srt.json > "$RUNNER_TEMP/nightly-srt.json"
+      - name: Check sandbox restrictions
+        if: steps.collect.outputs.has_failures == 'true'
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          srt --settings "$RUNNER_TEMP/nightly-srt.json" -- true
+          host_processes=$(ps -e -o comm=)
+          if ! grep -Fxq 'Runner.Worker' <<< "$host_processes"; then
+            echo 'Runner.Worker was not found on the host' >&2
+            exit 1
+          fi
+          srt --settings "$RUNNER_TEMP/nightly-srt.json" -- bash -c '
+            set -euo pipefail
+            processes=$(ps -e -o comm=)
+            if grep -Fxq "Runner.Worker" <<< "$processes"; then
+              echo "Runner.Worker is visible inside the sandbox" >&2
+              exit 1
+            fi
+          '
+          proxy_pid=$(cat "$RUNNER_TEMP/nightly-gateway-proxy.pid")
+          if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            echo 'Gateway proxy is not running' >&2
+            exit 1
+          fi
+          if [ ! -r "/proc/$proxy_pid/environ" ]; then
+            echo 'Gateway proxy environment is unreadable' >&2
+            exit 1
+          fi
+          if grep -azq '^GATEWAY_TOKEN=' "/proc/$proxy_pid/environ"; then
+            echo 'Gateway proxy inherited GATEWAY_TOKEN' >&2
+            exit 1
+          elif [ "$?" -ne 1 ]; then
+            echo 'Could not check gateway proxy environment' >&2
+            exit 1
+          fi
+          for command in \
+            'curl -sf https://example.com' \
+            'curl -sf --unix-socket /var/run/docker.sock http://localhost/version' \
+            'curl -sf --unix-socket /run/docker.sock http://localhost/version' \
+            'ls /home/runner/work/_temp/_runner_file_commands | grep -q .'; do
+            if srt --settings "$RUNNER_TEMP/nightly-srt.json" -- bash -c "$command"; then
+              echo 'Sandbox allowed a forbidden operation' >&2
+              exit 1
+            fi
+          done
+          probe="$RUNNER_TEMP/nightly-bundle/.sandbox-write-probe"
+          touch "$probe"
+          rm "$probe"
+          if srt --settings "$RUNNER_TEMP/nightly-srt.json" -- touch "$probe" || [ -e "$probe" ]; then
+            rm -f "$probe"
+            echo 'Sandbox allowed writes to the trusted Nightly bundle' >&2
+            exit 1
+          fi
       - name: Analyze failures in isolated worktrees
         if: steps.collect.outputs.has_failures == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GATEWAY_TOKEN: ${{ steps.gateway.outputs.token }}
-          GATEWAY_URL: ${{ steps.gateway.outputs.base-url }}
+          ANTHROPIC_BASE_URL: http://localhost:8080/anthropic
+          ANTHROPIC_AUTH_TOKEN: ${{ steps.gateway-proxy.outputs.token }}
           ANTHROPIC_CUSTOM_HEADERS: ${{ steps.gateway.outputs.custom-headers }}
+          # The auto permission classifier requires this alias; investigators inherit the main model.
+          ANTHROPIC_DEFAULT_SONNET_MODEL: databricks-claude-sonnet-5
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          CLAUDE_CODE_FORK_SUBAGENT: "0"
+          CLAUDE_CODE_ENABLE_TELEMETRY: "0"
+          CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: "0"
+          OTEL_TRACES_EXPORTER: none
+          OTEL_LOGS_EXPORTER: none
+          OTEL_METRICS_EXPORTER: none
+          XDG_DATA_HOME: /tmp/nightly-xdg-data
+          XDG_CONFIG_HOME: /tmp/nightly-xdg-config
+          XDG_CACHE_HOME: /tmp/nightly-xdg-cache
         run: |
-          cp .claude/scripts/run-nightly.sh "$RUNNER_TEMP/run-nightly.sh"
-          bash "$RUNNER_TEMP/run-nightly.sh"
+          umask 077
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          timeout --kill-after=10s 30m srt --settings "$RUNNER_TEMP/nightly-srt.json" -- \
+            env -u NO_PROXY -u no_proxy -u GITHUB_OUTPUT -u GITHUB_ENV -u GITHUB_PATH \
+              -u GITHUB_STATE -u GITHUB_STEP_SUMMARY claude \
+              --model databricks-claude-sonnet-5-5 \
+              --effort medium \
+              --permission-mode auto \
+              --setting-sources project \
+              --settings '{"worktree":{"baseRef":"head"}}' \
+              --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+              --tools Agent,Bash,Read,Grep,Glob,Write,Edit \
+              --no-session-persistence \
+              --print --verbose --output-format stream-json --forward-subagent-text \
+              "/nightly /tmp/nightly-context/snapshot.json /tmp/nightly-out" \
+            | .claude/scripts/stream.sh "$RUNNER_TEMP/nightly-bundle/report/stream.jsonl"
+      - name: Check coordinator worktree
+        if: steps.collect.outputs.has_failures == 'true'
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ] || \
+            [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo 'Nightly analysis changed the coordinator checkout' >&2
+            exit 1
+          fi
+      - name: Validate worker completion and stage report
+        if: steps.collect.outputs.has_failures == 'true'
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          python "$RUNNER_TEMP/validate-nightly-output.py" "$RUNNER_TEMP/nightly-bundle/report" /tmp/nightly-out
       - name: Prepare an empty report when no failed jobs need analysis
         if: steps.collect.outputs.has_failures != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/nightly-bundle/report"
           echo '{"groups": []}' > "$RUNNER_TEMP/nightly-bundle/report/report.json"
+      - name: Stop gateway proxy
+        if: always() && steps.collect.outputs.has_failures == 'true'
+        run: |
+          token=$(cat /proc/sys/kernel/random/uuid)
+          echo "::stop-commands::$token"
+          trap 'echo "::$token::"' EXIT
+          if [ -f "$RUNNER_TEMP/nightly-gateway-proxy.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/nightly-gateway-proxy.pid")" 2>/dev/null || true
+          fi
+          if [ -s "$RUNNER_TEMP/nightly-gateway-proxy.log" ]; then
+            cat "$RUNNER_TEMP/nightly-gateway-proxy.log"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         if: always()
