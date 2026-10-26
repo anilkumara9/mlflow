@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Preview nightly issues and reruns without executing them"
+        description: "Preview nightly issues without publishing them"
         required: false
         type: boolean
         default: true
@@ -170,7 +170,7 @@ jobs:
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
-      actions: write
+      actions: read
       contents: read
       issues: write
     steps:
@@ -196,39 +196,14 @@ jobs:
           token=$(cat /proc/sys/kernel/random/uuid)
           echo "::stop-commands::$token"
           trap 'echo "::$token::"' EXIT
-          jq --argjson apply "$APPLY" '
-            def bullets: map("- " + .) | join("\n");
-            def issue_body:
-              .summary + "\n\n### Evidence\n\n" + (.evidence | bullets)
-              + (if (.uncertainties | length) > 0 then
-                  "\n\n### Uncertainties\n\n" + (.uncertainties | bullets)
-                else "" end)
-              + "\n\n### CI jobs\n\n"
-              + ([.jobs[] | "- [\(.workflow) / \(.job)](\(.url))"] | join("\n"));
-            {
-              dry_run: ($apply | not),
-              issues: [.groups[] | select(.verdict == "new")
-                | {title, body: issue_body, labels: ["nightly"]}],
-              reruns: [
-                [.groups[] | .verdict as $verdict | .jobs[] | .url | split("/")
-                  | {run_id: (.[7] | tonumber), attempt: (.[9] | tonumber), verdict: $verdict}]
-                | group_by([.run_id, .attempt])[]
-                | select(.[0].attempt == 1 and (map(.verdict) | unique) == ["transient"])
-                | {run_id: .[0].run_id, expected_run_attempt: 1}
-              ],
-              findings: [.groups[] | select(.verdict != "new")]
-            }
-          ' /tmp/nightly-bundle/report.json > /tmp/nightly-plan.json
+          args=()
           if [ "$APPLY" = true ]; then
             gh label create nightly --repo mlflow/mlflow --color 5319e7 \
               --description 'Failures detected by scheduled CI jobs.' --force
-            while IFS= read -r issue; do
-              printf '%s\n' "$issue" | gh api repos/mlflow/mlflow/issues --method POST --input -
-            done < <(jq -c '.issues[]' /tmp/nightly-plan.json)
-            while IFS= read -r run_id; do
-              gh api "repos/mlflow/mlflow/actions/runs/$run_id/rerun-failed-jobs" --method POST
-            done < <(jq -r '.reruns[].run_id' /tmp/nightly-plan.json)
+            args+=(--apply)
           fi
+          python .claude/skills/nightly/scripts/publish.py \
+            /tmp/nightly-bundle/report.json "${args[@]}" > /tmp/nightly-plan.json
           cat /tmp/nightly-plan.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

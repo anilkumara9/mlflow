@@ -5,7 +5,7 @@ required: [groups]
 properties:
   groups:
     type: array
-    description: Causes covering every input failed job; jobs may appear in several causes.
+    description: Non-transient causes; jobs may appear in several causes.
     items:
       $ref: "#/$defs/group"
 $defs:
@@ -21,7 +21,6 @@ $defs:
         minLength: 1
       url:
         type: string
-        # The publisher derives run ID and attempt from this URL.
         pattern: '^https://github\.com/mlflow/mlflow/actions/runs/[0-9]+/attempts/[0-9]+/job/[0-9]+$'
   group:
     type: object
@@ -30,9 +29,8 @@ $defs:
       verdict:
         # new: investigated problem without a matching open nightly issue.
         # already_reported: matches an open nightly issue.
-        # transient: supported temporary error; only attempt 1 may be retried.
         # uncertain: insufficient evidence or an incomplete investigation.
-        enum: [new, already_reported, transient, uncertain]
+        enum: [new, already_reported, uncertain]
       summary:
         type: string
         minLength: 1
