@@ -184,7 +184,11 @@ with (stage / "stream.jsonl").open() as stream:
                     agent_activity = True
                     if block.get("input", {}).get("isolation") == "worktree":
                         isolated_calls.add(block["id"])
-        elif event.get("type") == "user" and event.get("tool_use_result", {}).get("status") == "completed":
+        elif (
+            event.get("type") == "user"
+            and isinstance(event.get("tool_use_result"), dict)
+            and event["tool_use_result"].get("status") == "completed"
+        ):
             for block in event.get("message", {}).get("content", []):
                 if block.get("type") == "tool_result" and not block.get("is_error"):
                     completed_calls.add(block["tool_use_id"])
