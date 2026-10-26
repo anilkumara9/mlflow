@@ -38,7 +38,7 @@ echo "::stop-commands::$command_token"
 trap cleanup EXIT
 
 mkdir -p "$stage_dir" "$out_dir" ~/.claude ~/.cache/uv ~/.npm
-if [ ! -d "$trusted_bundle/context" ]; then
+if [ ! -f "$trusted_bundle/context/snapshot.json" ]; then
   echo 'Nightly collector snapshot was not staged before analysis' >&2
   exit 1
 fi
@@ -145,7 +145,7 @@ timeout --kill-after=10s 30m srt --settings "$sandbox_settings" -- \
     --tools Agent,Bash,Read,Grep,Glob,Write,Edit \
     --no-session-persistence \
     --print --verbose --output-format stream-json --forward-subagent-text \
-    "/nightly $context_dir/inventory.json $context_dir/issues.json $out_dir" \
+    "/nightly $context_dir/snapshot.json $out_dir" \
   | .claude/scripts/stream.sh "$stage_dir/stream.jsonl" || agent_status=$?
 
 if [ "$agent_status" -ne 0 ]; then

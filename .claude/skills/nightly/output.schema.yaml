@@ -13,12 +13,12 @@ $defs:
   job:
     type: object
     additionalProperties: false
-    required: [workflow_name, name, url]
+    required: [workflow, job, url]
     properties:
-      workflow_name:
+      workflow:
         type: string
         minLength: 1
-      name:
+      job:
         type: string
         minLength: 1
       url:

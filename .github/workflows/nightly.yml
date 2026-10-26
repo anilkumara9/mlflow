@@ -60,19 +60,19 @@ jobs:
             args+=(--workflow "$SOURCE_WORKFLOW")
           fi
           uv run --directory .claude/skills --package skills skills nightly collect --out-dir /tmp/nightly-context "${args[@]}"
-          has_failures=$(jq -r '[.runs[].jobs[]] | length > 0' /tmp/nightly-context/inventory.json)
+          has_failures=$(jq -r '[.runs[].jobs[]] | length > 0' /tmp/nightly-context/snapshot.json)
           echo "has_failures=$has_failures" >> "$GITHUB_OUTPUT"
       - name: Preserve original inputs outside the agent's writable paths
         run: |
           mkdir -p "$RUNNER_TEMP/nightly-bundle/context"
-          cp /tmp/nightly-context/{inventory,issues,snapshot}.json "$RUNNER_TEMP/nightly-bundle/context/"
+          cp /tmp/nightly-context/snapshot.json "$RUNNER_TEMP/nightly-bundle/context/"
       - uses: ./.github/actions/setup-claude
         if: steps.collect.outputs.has_failures == 'true'
       - name: Prepare analysis dependencies and source revisions
         if: steps.collect.outputs.has_failures == 'true'
         run: |
           uv sync --package skills
-          jq -r '.runs[].head_sha' /tmp/nightly-context/inventory.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
+          jq -r '.runs[].head_sha' /tmp/nightly-context/snapshot.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
           while IFS= read -r source_sha; do
             [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || exit 1
             if ! git cat-file -e "$source_sha^{commit}" 2>/dev/null; then
@@ -149,10 +149,8 @@ jobs:
             args+=(--apply)
           fi
           timeout 7m uv run --directory .claude/skills --package skills skills nightly post-check \
-            --inventory /tmp/nightly-bundle/context/inventory.json \
-            --issues /tmp/nightly-bundle/context/issues.json \
+            --snapshot /tmp/nightly-bundle/context/snapshot.json \
             --report /tmp/nightly-bundle/report/report.json \
-            --state /tmp/nightly-bundle/context/snapshot.json \
             --plan /tmp/nightly-plan.json "${args[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

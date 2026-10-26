@@ -1,21 +1,23 @@
 ---
 name: nightly
 description: Analyze scheduled CI failures across configured workflows, group related causes, and prepare deduplicated nightly issues for workflow publication.
-argument-hint: "<inventory_path> <issues_path> <out_dir>"
-arguments: [inventory_path, issues_path, out_dir]
+argument-hint: "<snapshot_path> <out_dir>"
+arguments: [snapshot_path, out_dir]
 ---
 
 # Nightly failure coordinator
 
-Read `$inventory_path`, the workflow's trusted JSON inventory. Its `runs` contain
+Read `$snapshot_path`, the workflow's trusted JSON snapshot with `repository`, `runs`,
+`issues`, and `state`. Each run supplies
 `head_sha` (the tested source SHA), `retry_available` (the executor's retry-policy
-decision), and `jobs` with `workflow_name`, `name`, and attempt-pinned `url`; preserve
-each job's association with its run. Read `$issues_path`, its snapshot of open issues
-labeled `nightly`, [workflows.yaml](workflows.yaml), and
-[output.schema.yaml](output.schema.yaml). Analyze only the supplied inventory; do not
-modify the allowlist or discover additional source runs. Weekly scheduled workflows
+decision), and `jobs` with `workflow`, `job`, and attempt-pinned `url`; preserve
+each job's association with its run. Its `issues` are open issues labeled `nightly`;
+its `state` holds processing receipts. The collector already excludes processed runs.
+Read [workflows.yaml](workflows.yaml) and [output.schema.yaml](output.schema.yaml).
+Analyze only the supplied runs; do not modify the allowlist or discover additional
+source runs. Weekly scheduled workflows
 are valid sources too. Stop without a payload for an unsupported source or malformed
-job URL; never silently drop jobs. An empty inventory produces `{"groups": []}`.
+job URL; never silently drop jobs. A snapshot with no runs produces `{"groups": []}`.
 
 The collector selects the latest scheduled run of each configured workflow before
 checking for failure. A newer successful or in-progress run supersedes older failures.
@@ -34,14 +36,14 @@ time to reconcile, cover uninvestigated groups as `uncertain`, and validate the 
 
 ## Collect and group
 
-1. Use [analyze-ci](../analyze-ci/SKILL.md) to fetch all inventory jobs in one invocation,
+1. Use [analyze-ci](../analyze-ci/SKILL.md) to fetch all supplied jobs in one invocation,
    passing their exact attempt-pinned URLs. Read the prefetched failed-step logs and any
    installed-package versions or package/snapshot changes available. Optional Python
    package and snapshot metadata may be absent for other workflows; that is normal.
    Preserve raw-log paths for deeper inspection; do not fetch the same logs again or
    independently compare snapshots. Missing diagnostic evidence must become an
    uncertainty, not a guessed cause.
-   Preserve the complete fetched job metadata and read the full issue snapshot; do not
+   Preserve the complete fetched job metadata and read the snapshot's full `issues`; do not
    truncate these inputs before grouping or duplicate matching.
 2. Filter obvious transient failures only when every affected job's source run has
    `retry_available: true`. The logs must support a short-lived runner or network
@@ -124,7 +126,7 @@ transient. Mixed causes remain separate findings and block that run's automatic 
 
 Write `$out_dir/report.json`, shaped exactly as `{"groups": [...]}`. Every group
 requires `verdict`, `summary`, `jobs`, `evidence`, and `uncertainties`. Copy each job's
-`workflow_name`, `name`, and attempt-pinned `url` exactly from the inventory; do not add
+`workflow`, `job`, and attempt-pinned `url` exactly from the snapshot; do not add
 numeric run, attempt, or job IDs. Every input failed job must occur in at least one
 group. The same job may occur in multiple groups when it exhibits distinct causes.
 After all worker results are reconciled, check coverage, reject invented jobs, and
@@ -133,14 +135,14 @@ preserve the supplied metadata. A final chat response cannot substitute for the 
 Validate before finishing and repair any errors:
 
 ```bash
-uv run --no-sync --package skills python - "$inventory_path" "$issues_path" "$out_dir/report.json" <<'PY'
+uv run --no-sync --package skills python - "$snapshot_path" "$out_dir/report.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 from skills.commands.nightly import validate_report
 
-inventory, issues, report = [json.loads(Path(path).read_text()) for path in sys.argv[1:]]
-validate_report(report, inventory, issues)
+snapshot, report = [json.loads(Path(path).read_text()) for path in sys.argv[1:]]
+validate_report(report, snapshot)
 PY
 ```

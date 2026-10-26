@@ -77,7 +77,7 @@ def restore_state(default_branch: str) -> dict[str, Any]:
             check=True,
         )
         with zipfile.ZipFile(io.BytesIO(result.stdout)) as archive:
-            state = json.loads(archive.read("snapshot.json"))
+            state = json.loads(archive.read("snapshot.json"))["state"]
         if (
             not isinstance(state, dict)
             or set(state) != {"processed", "issues", "reruns"}
@@ -143,7 +143,7 @@ def failed_jobs(run: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def public_job(job: dict[str, Any]) -> dict[str, str]:
-    return {key: job[key] for key in ("workflow_name", "name", "url")}
+    return {key: job[key] for key in ("workflow", "job", "url")}
 
 
 def latest_run(workflow_path: str) -> dict[str, Any] | None:
@@ -195,16 +195,17 @@ def collect(out_dir: Path, workflow: str | None = None) -> None:
         run["jobs"] = [
             {
                 "id": job["id"],
-                "workflow_name": run["name"],
-                "name": job["name"],
+                "workflow": run["name"],
+                "job": job["name"],
                 "url": f"{run['html_url']}/job/{job['id']}",
             }
             for job in jobs
         ]
         runs.append(run)
-    write_json(out_dir / "inventory.json", {"repository": REPOSITORY, "runs": runs})
-    write_json(out_dir / "issues.json", load_issues())
-    write_json(out_dir / "snapshot.json", state)
+    write_json(
+        out_dir / "snapshot.json",
+        {"repository": REPOSITORY, "runs": runs, "issues": load_issues(), "state": state},
+    )
 
 
 def nightly_issue(issue: dict[str, Any]) -> bool:
@@ -215,19 +216,17 @@ def nightly_issue(issue: dict[str, Any]) -> bool:
     )
 
 
-def validate_report(
-    report: dict[str, Any], inventory: dict[str, Any], issues: list[dict[str, Any]]
-) -> None:
+def validate_report(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
     Draft202012Validator(yaml.safe_load(SCHEMA_PATH.read_text())).validate(report)
-    if inventory["repository"] != REPOSITORY:
+    if snapshot["repository"] != REPOSITORY:
         raise ValueError("Unsupported repository")
-    known_jobs = {job["url"]: public_job(job) for run in inventory["runs"] for job in run["jobs"]}
+    known_jobs = {job["url"]: public_job(job) for run in snapshot["runs"] for job in run["jobs"]}
     retry_available = {
         job["url"]: run["run_attempt"] == first_attempt(run)
-        for run in inventory["runs"]
+        for run in snapshot["runs"]
         for job in run["jobs"]
     }
-    open_issues = {issue["number"] for issue in issues if nightly_issue(issue)}
+    open_issues = {issue["number"] for issue in snapshot["issues"] if nightly_issue(issue)}
     seen = set()
     drafts = set()
     for group in report["groups"]:
@@ -279,7 +278,7 @@ def marker(key: str) -> str:
 
 def issue_body(group: dict[str, Any]) -> str:
     context = "\n".join(
-        f"- [{job['workflow_name']} / {job['name']}]({job['url']})" for job in group["jobs"]
+        f"- [{job['workflow']} / {job['job']}]({job['url']})" for job in group["jobs"]
     )
     receipt = "\n\n" + marker(issue_key(group))
     body = f"{group['body']}\n\n### CI jobs\n\n{context}"
@@ -291,15 +290,14 @@ def issue_body(group: dict[str, Any]) -> str:
 
 def post_check(
     report: dict[str, Any],
-    inventory: dict[str, Any],
-    issues: list[dict[str, Any]],
-    state: dict[str, Any],
-    state_path: Path,
+    snapshot: dict[str, Any],
+    snapshot_path: Path,
     *,
     apply: bool = False,
 ) -> dict[str, Any]:
-    validate_report(report, inventory, issues)
-    pending = [run for run in inventory["runs"] if run_key(run) not in state["processed"]]
+    validate_report(report, snapshot)
+    state = snapshot["state"]
+    pending = [run for run in snapshot["runs"] if run_key(run) not in state["processed"]]
     plan: dict[str, Any] = {
         "dry_run": not apply,
         "issues": [],
@@ -315,7 +313,7 @@ def post_check(
     current_issues = load_issues()
     current_numbers = {issue["number"] for issue in current_issues if nightly_issue(issue)}
     receipts = {marker(issue_key(group)) for group in report["groups"] if group["verdict"] == "new"}
-    original_issues = {issue["number"]: issue for issue in issues}
+    original_issues = {issue["number"]: issue for issue in snapshot["issues"]}
     if any(
         (
             issue["number"] not in original_issues
@@ -367,7 +365,7 @@ def post_check(
         if apply:
             if number is None:
                 group_urls = {job["url"] for job in group["jobs"]}
-                for source in inventory["runs"]:
+                for source in snapshot["runs"]:
                     if any(job["url"] in group_urls for job in source["jobs"]):
                         fresh_run(source)
                 created = api(
@@ -378,7 +376,7 @@ def post_check(
                 number = created["number"]
                 action["issue_number"] = number
             state["issues"][key] = number
-            write_json(state_path, state)
+            write_json(snapshot_path, snapshot)
 
     verdicts: dict[str, set[str]] = {}
     for group in report["groups"]:
@@ -398,11 +396,11 @@ def post_check(
             fresh_run(run)
             api(f"repos/{REPOSITORY}/actions/runs/{run['id']}/rerun-failed-jobs", method="POST")
             state["reruns"].append(key)
-            write_json(state_path, state)
+            write_json(snapshot_path, snapshot)
 
     if apply:
         state["processed"] = sorted(set(state["processed"]) | {run_key(run) for run in pending})
-        write_json(state_path, state)
+        write_json(snapshot_path, snapshot)
     return plan
 
 
@@ -411,10 +409,8 @@ def run(args: argparse.Namespace) -> None:
         collect(args.out_dir, args.workflow)
         return
     report = json.loads(args.report.read_text())
-    inventory = json.loads(args.inventory.read_text())
-    issues = json.loads(args.issues.read_text())
-    state = json.loads(args.state.read_text())
-    plan = post_check(report, inventory, issues, state, args.state, apply=args.apply)
+    snapshot = json.loads(args.snapshot.read_text())
+    plan = post_check(report, snapshot, args.snapshot, apply=args.apply)
     rendered = json.dumps(plan, indent=2) + "\n"
     if args.plan:
         args.plan.write_text(rendered)
@@ -430,7 +426,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         "--workflow", choices=[path.rsplit("/", 1)[-1] for path in source_workflows()]
     )
     check_parser = commands.add_parser("post-check")
-    for name in ("inventory", "issues", "report", "state"):
+    for name in ("snapshot", "report"):
         check_parser.add_argument(f"--{name}", type=Path, required=True)
     check_parser.add_argument("--plan", type=Path)
     check_parser.add_argument("--apply", action="store_true")
