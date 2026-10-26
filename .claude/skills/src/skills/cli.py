@@ -5,7 +5,6 @@ from skills.commands import (
     embed_media,
     fetch_logs,
     load_rules,
-    nightly,
     upload_media,
 )
 
@@ -18,7 +17,6 @@ def build_parser() -> argparse.ArgumentParser:
     embed_media.register(subparsers)
     fetch_logs.register(subparsers)
     load_rules.register(subparsers)
-    nightly.register(subparsers)
     upload_media.register(subparsers)
 
     return parser

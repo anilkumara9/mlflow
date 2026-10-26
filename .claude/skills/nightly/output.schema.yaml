@@ -21,11 +21,17 @@ $defs:
         minLength: 1
       url:
         type: string
+        # The publisher derives run ID and attempt from this URL.
+        pattern: '^https://github\.com/mlflow/mlflow/actions/runs/[0-9]+/attempts/[0-9]+/job/[0-9]+$'
   group:
     type: object
     required: [verdict, summary, jobs, evidence, uncertainties]
     properties:
       verdict:
+        # new: investigated problem without a matching open nightly issue.
+        # already_reported: matches an open nightly issue.
+        # transient: supported temporary error; only attempt 1 may be retried.
+        # uncertain: insufficient evidence or an incomplete investigation.
         enum: [new, already_reported, transient, uncertain]
       summary:
         type: string
@@ -43,11 +49,13 @@ $defs:
           type: string
           minLength: 1
       uncertainties:
+        # Unverified mechanisms and limits of the investigation.
         type: array
         items:
           type: string
           minLength: 1
       title:
+        # The publisher builds issue bodies from the other report fields.
         type: string
         minLength: 1
         maxLength: 200
