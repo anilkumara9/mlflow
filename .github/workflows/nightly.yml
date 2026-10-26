@@ -42,29 +42,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version-file: .python-version
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version-file: pyproject.toml
-          resolution-strategy: lowest
-          enable-cache: false
-      - name: Configure Python tooling
-        run: |
-          python_version=$(cat .python-version)
-          downloads=$(uv python list "$python_version" --all-versions --only-downloads)
-          if [[ -z "$downloads" ]]; then
-            echo "::error::$(uv --version) cannot download Python $python_version for this platform. Update required-version in pyproject.toml."
-            exit 1
-          fi
-          echo "$downloads"
-          {
-            echo 'UV_INDEX_STRATEGY=unsafe-first-match'
-            echo 'UV_NO_PROGRESS=1'
-            echo 'UV_EXCLUDE_NEWER=P7D'
-            echo 'HF_HUB_DISABLE_PROGRESS_BARS=1'
-          } >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-python
       - name: Collect scheduled failures and issue history
         id: collect
         env:
@@ -73,17 +51,11 @@ jobs:
           uv run --directory .claude/skills --package skills skills nightly collect --out-dir /tmp/nightly-context
           has_failures=$(jq -r '[.runs[].jobs[]] | length > 0' /tmp/nightly-context/snapshot.json)
           echo "has_failures=$has_failures" >> "$GITHUB_OUTPUT"
-      - name: Preserve original inputs outside the agent's writable paths
-        run: |
-          mkdir -p "$RUNNER_TEMP/nightly-bundle/context"
+          mkdir -p "$RUNNER_TEMP/nightly-bundle/"{context,report}
           cp /tmp/nightly-context/snapshot.json "$RUNNER_TEMP/nightly-bundle/context/"
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+          echo '{"groups": []}' > "$RUNNER_TEMP/nightly-bundle/report/report.json"
+      - uses: ./.github/actions/setup-node
         if: steps.collect.outputs.has_failures == 'true'
-        with:
-          node-version: "24"
-      - name: Install npm
-        if: steps.collect.outputs.has_failures == 'true'
-        run: npm install -g npm@12.0.1
       - name: Install sandbox dependencies
         if: steps.collect.outputs.has_failures == 'true'
         run: |
@@ -106,40 +78,21 @@ jobs:
         if: steps.collect.outputs.has_failures == 'true'
         run: |
           uv sync --package skills
-          jq -r '.runs[].head_sha' /tmp/nightly-context/snapshot.json | sort -u > "$RUNNER_TEMP/nightly-source-shas.txt"
-          while IFS= read -r source_sha; do
-            if ! git cat-file -e "$source_sha^{commit}" 2>/dev/null; then
-              git fetch --no-tags --depth=1 origin "$source_sha"
-            fi
-          done < "$RUNNER_TEMP/nightly-source-shas.txt"
-      - name: Set up AI Gateway
+          source_sha=$(jq -r '.runs[0].head_sha' /tmp/nightly-context/snapshot.json)
+          git fetch --no-tags --depth=1 origin "$source_sha"
+      - uses: ./.github/actions/setup-gateway
         id: gateway
         if: steps.collect.outputs.has_failures == 'true'
-        env:
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
-          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
-          TASK: nightly
-        run: |
-          RESPONSE=$(curl -sS --max-time 15 \
-            -u "$DATABRICKS_CLIENT_ID:$DATABRICKS_CLIENT_SECRET" \
-            -d grant_type=client_credentials -d scope=ai-gateway \
-            "$DATABRICKS_HOST/oidc/v1/token")
-          TOKEN=$(jq -r '.access_token // empty' <<< "$RESPONSE")
-          if [ -z "$TOKEN" ]; then
-            echo "::error::Gateway token exchange failed: $(jq -r '.error_description // .error // "no access_token"' <<< "$RESPONSE")"
-            exit 1
-          fi
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-          echo "base-url=${DATABRICKS_HOST%/}/ai-gateway" >> "$GITHUB_OUTPUT"
-          TAGS=$(jq -cn --arg repository "$GITHUB_REPOSITORY" --arg task "$TASK" '{$repository, $task}')
-          echo "custom-headers=Databricks-Ai-Gateway-Request-Tags: $TAGS" >> "$GITHUB_OUTPUT"
+        with:
+          task: nightly
+          host: ${{ secrets.DATABRICKS_HOST }}
+          client-id: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          client-secret: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       - name: Prepare sandbox paths
         if: steps.collect.outputs.has_failures == 'true'
         run: |
           umask 077
-          mkdir -p "$RUNNER_TEMP/nightly-bundle/report" /tmp/nightly-out ~/.claude ~/.cache/uv ~/.npm
+          mkdir -p /tmp/nightly-out ~/.claude ~/.cache/uv ~/.npm
           echo '{}' > ~/.claude.json
       - name: Start gateway proxy
         id: gateway-proxy
@@ -158,14 +111,8 @@ jobs:
           proxy_pid=$!
           printf '%s\n' "$proxy_pid" > "$RUNNER_TEMP/nightly-gateway-proxy.pid"
           unset GATEWAY_TOKEN proxy_token
-          for _ in $(seq 1 30); do
-            kill -0 "$proxy_pid" 2>/dev/null || break
-            if curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz > /dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz > /dev/null
+          curl --noproxy '*' --retry 30 --retry-connrefused --retry-delay 1 \
+            -fsS http://127.0.0.1:8080/healthz > /dev/null
       - name: Configure sandbox log access
         if: steps.collect.outputs.has_failures == 'true'
         env:
@@ -173,70 +120,15 @@ jobs:
         run: |
           # analyze-ci follows GitHub's signed log-storage redirects.
           gh api meta > "$RUNNER_TEMP/nightly-github-meta.json"
-          jq --exit-status --arg trusted_bundle "$RUNNER_TEMP/nightly-bundle" \
+          jq --arg trusted_bundle "$RUNNER_TEMP/nightly-bundle" \
             --slurpfile meta "$RUNNER_TEMP/nightly-github-meta.json" '
-            ($meta[0].domains.actions
-              | if type == "array" then . else error("Invalid Actions domains in GitHub /meta") end
-              | map(select(test("^productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net$")))
-              | unique) as $domains
-            | if ($domains | length) == 0 then
-                error("GitHub /meta returned no Actions log-storage domains")
-              else
-                .network.allowedDomains += ($domains | map(. + ":443"))
-              end
+            .network.allowedDomains += [
+              $meta[0].domains.actions[]
+              | select(test("^productionresultssa[0-9]+\\.blob\\.core\\.windows\\.net$"))
+              | . + ":443"
+            ]
             | .filesystem.denyWrite += [$trusted_bundle]
           ' .claude/sandbox/srt.json > "$RUNNER_TEMP/nightly-srt.json"
-      - name: Check sandbox restrictions
-        if: steps.collect.outputs.has_failures == 'true'
-        run: |
-          srt --settings "$RUNNER_TEMP/nightly-srt.json" -- true
-          host_processes=$(ps -e -o comm=)
-          if ! grep -Fxq 'Runner.Worker' <<< "$host_processes"; then
-            echo 'Runner.Worker was not found on the host' >&2
-            exit 1
-          fi
-          srt --settings "$RUNNER_TEMP/nightly-srt.json" -- bash -c '
-            set -euo pipefail
-            processes=$(ps -e -o comm=)
-            if grep -Fxq "Runner.Worker" <<< "$processes"; then
-              echo "Runner.Worker is visible inside the sandbox" >&2
-              exit 1
-            fi
-          '
-          proxy_pid=$(cat "$RUNNER_TEMP/nightly-gateway-proxy.pid")
-          if ! kill -0 "$proxy_pid" 2>/dev/null; then
-            echo 'Gateway proxy is not running' >&2
-            exit 1
-          fi
-          if [ ! -r "/proc/$proxy_pid/environ" ]; then
-            echo 'Gateway proxy environment is unreadable' >&2
-            exit 1
-          fi
-          if grep -azq '^GATEWAY_TOKEN=' "/proc/$proxy_pid/environ"; then
-            echo 'Gateway proxy inherited GATEWAY_TOKEN' >&2
-            exit 1
-          elif [ "$?" -ne 1 ]; then
-            echo 'Could not check gateway proxy environment' >&2
-            exit 1
-          fi
-          for command in \
-            'curl -sf https://example.com' \
-            'curl -sf --unix-socket /var/run/docker.sock http://localhost/version' \
-            'curl -sf --unix-socket /run/docker.sock http://localhost/version' \
-            'ls /home/runner/work/_temp/_runner_file_commands | grep -q .'; do
-            if srt --settings "$RUNNER_TEMP/nightly-srt.json" -- bash -c "$command"; then
-              echo 'Sandbox allowed a forbidden operation' >&2
-              exit 1
-            fi
-          done
-          probe="$RUNNER_TEMP/nightly-bundle/.sandbox-write-probe"
-          touch "$probe"
-          rm "$probe"
-          if srt --settings "$RUNNER_TEMP/nightly-srt.json" -- touch "$probe" || [ -e "$probe" ]; then
-            rm -f "$probe"
-            echo 'Sandbox allowed writes to the trusted Nightly bundle' >&2
-            exit 1
-          fi
       - name: Analyze failures in isolated worktrees
         if: steps.collect.outputs.has_failures == 'true'
         env:
@@ -272,45 +164,14 @@ jobs:
               --print --verbose --output-format stream-json \
               "/nightly /tmp/nightly-context/snapshot.json /tmp/nightly-out" \
             | .claude/scripts/stream.sh "$RUNNER_TEMP/nightly-bundle/report/stream.jsonl"
-      - name: Check coordinator worktree
-        if: steps.collect.outputs.has_failures == 'true'
-        run: |
-          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ] || \
-            [ -n "$(git status --porcelain --untracked-files=all)" ]; then
-            echo 'Nightly analysis changed the coordinator checkout' >&2
-            exit 1
-          fi
       - name: Stage analysis report
         if: steps.collect.outputs.has_failures == 'true'
         run: |
           umask 077
-          python - <<'PY'
-          import os
-          import shutil
-          import stat
-          from pathlib import Path
-
-          stage = Path(os.environ["RUNNER_TEMP"]) / "nightly-bundle" / "report"
-          flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-          directory_fd = os.open("/tmp/nightly-out", flags | os.O_DIRECTORY)
-          try:
-              report_fd = os.open("report.json", flags, dir_fd=directory_fd)
-              with os.fdopen(report_fd, "rb") as source:
-                  metadata = os.fstat(source.fileno())
-                  if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 2 * 1024 * 1024:
-                      raise ValueError("Nightly report must be a regular file no larger than 2 MiB")
-                  with (stage / "report.json").open("xb") as target:
-                      shutil.copyfileobj(source, target)
-          finally:
-              os.close(directory_fd)
-          PY
-      - name: Prepare an empty report when no failed jobs need analysis
-        if: steps.collect.outputs.has_failures != 'true'
-        run: |
-          mkdir -p "$RUNNER_TEMP/nightly-bundle/report"
-          echo '{"groups": []}' > "$RUNNER_TEMP/nightly-bundle/report/report.json"
+          srt --settings "$RUNNER_TEMP/nightly-srt.json" -- cat /tmp/nightly-out/report.json \
+            > "$RUNNER_TEMP/nightly-bundle/report/report.json"
       - name: Stop gateway proxy
-        if: always() && steps.collect.outputs.has_failures == 'true'
+        if: always()
         run: |
           token=$(cat /proc/sys/kernel/random/uuid)
           echo "::stop-commands::$token"
@@ -332,11 +193,6 @@ jobs:
 
   execute:
     needs: analyze
-    if: >-
-      always() && github.repository == 'mlflow/mlflow' &&
-      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) ||
-       (github.event_name == 'workflow_dispatch' && inputs.dry_run)) &&
-      needs.analyze.result == 'success'
     runs-on: ubuntu-slim
     timeout-minutes: 10
     permissions:
@@ -348,29 +204,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version-file: .python-version
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version-file: pyproject.toml
-          resolution-strategy: lowest
-          enable-cache: false
-      - name: Configure Python tooling
-        run: |
-          python_version=$(cat .python-version)
-          downloads=$(uv python list "$python_version" --all-versions --only-downloads)
-          if [[ -z "$downloads" ]]; then
-            echo "::error::$(uv --version) cannot download Python $python_version for this platform. Update required-version in pyproject.toml."
-            exit 1
-          fi
-          echo "$downloads"
-          {
-            echo 'UV_INDEX_STRATEGY=unsafe-first-match'
-            echo 'UV_NO_PROGRESS=1'
-            echo 'UV_EXCLUDE_NEWER=P7D'
-            echo 'HF_HUB_DISABLE_PROGRESS_BARS=1'
-          } >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-python
       # The bundle contains the host-preserved original inputs and the agent's report.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -387,6 +221,8 @@ jobs:
           trap 'echo "::$token::"' EXIT
           args=()
           if [ "$APPLY" = true ]; then
+            gh label create nightly --repo mlflow/mlflow --color 5319e7 \
+              --description 'Failures detected by scheduled CI jobs.' --force
             args+=(--apply)
           fi
           timeout 7m uv run --directory .claude/skills --package skills skills nightly post-check \
@@ -400,15 +236,8 @@ jobs:
           path: /tmp/nightly-plan.json
           if-no-files-found: ignore
           retention-days: 7
-      - name: Check for durable live state
-        id: state
-        if: always() && (github.event_name == 'schedule' || !inputs.dry_run)
-        run: |
-          if [ -f /tmp/nightly-bundle/context/snapshot.json ]; then
-            echo 'exists=true' >> "$GITHUB_OUTPUT"
-          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always() && steps.state.outputs.exists == 'true'
+        if: success() && (github.event_name == 'schedule' || !inputs.dry_run)
         with:
           name: nightly-state
           path: /tmp/nightly-bundle/context/snapshot.json

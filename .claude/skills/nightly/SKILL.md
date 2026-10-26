@@ -48,7 +48,7 @@ Reconcile completed findings across groups, merging shared causes and splitting
 unrelated ones. Keep unverified mechanisms in `uncertainties`; a confirmed failure
 can be `new` even when its exact trigger is unknown. The coordinator chooses:
 
-- `new`: investigated problem without a matching issue; supply `title` and `body`.
+- `new`: investigated problem without a matching issue; supply `title`.
 - `already_reported`: matching open `nightly` issue; supply `issue_number`.
 - `transient`: supported transient failure with retries available for every run.
 - `uncertain`: insufficient evidence, ambiguous match, or incomplete investigation.
@@ -56,5 +56,5 @@ can be `new` even when its exact trigger is unknown. The coordinator chooses:
 Write `$out_dir/report.json` as `{"groups": [...]}`, following
 [output.schema.yaml](output.schema.yaml). Copy `workflow`, `job`, and `url` exactly
 from the snapshot. Cover every input failed job; a job may appear in multiple groups
-for distinct causes. Include evidence, tested SHAs, and uncertainties. Check coverage
-and schema compliance before finishing. With no supplied jobs, write `{"groups": []}`.
+for distinct causes. Include evidence, tested SHAs, and uncertainties; the executor
+builds issue bodies from these fields. With no supplied jobs, write `{"groups": []}`.

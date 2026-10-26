@@ -52,10 +52,6 @@ $defs:
         minLength: 1
         maxLength: 200
         pattern: '^[^\r\n]+$'
-      body:
-        type: string
-        minLength: 1
-        maxLength: 60000
       issue_number:
         type: integer
         minimum: 1
@@ -65,7 +61,7 @@ $defs:
             verdict:
               const: new
         then:
-          required: [title, body]
+          required: [title]
       - if:
           properties:
             verdict:
