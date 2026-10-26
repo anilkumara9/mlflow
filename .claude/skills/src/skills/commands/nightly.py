@@ -7,7 +7,6 @@ import json
 import subprocess
 import sys
 import zipfile
-from functools import cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,6 +14,9 @@ import yaml
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
 REPOSITORY = "mlflow/mlflow"
+# TODO: Support additional nightly workflows.
+SOURCE_WORKFLOW = "cross-version-tests.yml"
+SOURCE_NAME = "Cross version tests"
 NIGHTLY_WORKFLOW = ".github/workflows/nightly.yml"
 SCHEMA_PATH = Path(__file__).parents[3] / "nightly" / "output.schema.yaml"
 FAILED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
@@ -99,30 +101,16 @@ def load_issues(*, state: str = "open") -> list[dict[str, Any]]:
     ]
 
 
-@cache
-def source_workflows() -> dict[str, dict[str, Any]]:
-    profiles = yaml.safe_load(SCHEMA_PATH.with_name("workflows.yaml").read_text())
-    return {f".github/workflows/{filename}": profile for filename, profile in profiles.items()}
-
-
-def first_attempt(run: dict[str, Any]) -> int:
-    profile = source_workflows().get(run["path"].split("@")[0])
-    if profile is None or profile["name"] != run["name"]:
-        raise ValueError(f"Unsupported source workflow: {run['path']}")
-    return int(profile.get("first_attempt", 1))
-
-
 def source_run(run: dict[str, Any], default_branch: str) -> bool:
-    profile = source_workflows().get(run["path"].split("@")[0])
     return bool(
-        profile is not None
-        and run["name"] == profile["name"]
+        run["path"].split("@")[0] == f".github/workflows/{SOURCE_WORKFLOW}"
+        and run["name"] == SOURCE_NAME
         and run["event"] == "schedule"
         and run["head_branch"] == default_branch
         and run["head_repository"]["full_name"] == REPOSITORY
         and run["status"] == "completed"
         and run["conclusion"] == "failure"
-        and run["run_attempt"] >= first_attempt(run)
+        and run["run_attempt"] >= 1
     )
 
 
@@ -146,62 +134,53 @@ def public_job(job: dict[str, Any]) -> dict[str, str]:
     return {key: job[key] for key in ("workflow", "job", "url")}
 
 
-def latest_run(workflow_path: str) -> dict[str, Any] | None:
-    filename = workflow_path.rsplit("/", 1)[-1]
-    runs = api(f"repos/{REPOSITORY}/actions/workflows/{filename}/runs?event=schedule&per_page=1")[
-        "workflow_runs"
-    ]
+def latest_run() -> dict[str, Any] | None:
+    runs = api(
+        f"repos/{REPOSITORY}/actions/workflows/{SOURCE_WORKFLOW}/runs?event=schedule&per_page=1"
+    )["workflow_runs"]
     return cast(dict[str, Any], runs[0]) if runs else None
 
 
-def collect(out_dir: Path, workflow: str | None = None) -> None:
-    workflows = source_workflows()
-    if workflow is not None:
-        path = f".github/workflows/{workflow}"
-        if path not in workflows:
-            raise ValueError(f"Unsupported source workflow: {workflow}")
-        workflows = {path: workflows[path]}
+def collect(out_dir: Path) -> None:
     default_branch = api(f"repos/{REPOSITORY}")["default_branch"]
     state = restore_state(default_branch)
     runs = []
-    for workflow_path in workflows:
-        candidate = latest_run(workflow_path)
-        if candidate is None:
-            continue
-        if not source_run(candidate, default_branch) or run_key(candidate) in state["processed"]:
-            continue
-        jobs = failed_jobs(candidate)
-        if not jobs:
-            continue
-        run = {
-            key: candidate[key]
-            for key in (
-                "id",
-                "run_attempt",
-                "head_sha",
-                "name",
-                "path",
-                "event",
-                "head_branch",
-                "status",
-                "conclusion",
-            )
-        }
-        run["html_url"] = (
-            f"https://github.com/{REPOSITORY}/actions/runs/{run['id']}"
-            f"/attempts/{run['run_attempt']}"
-        )
-        run["retry_available"] = run["run_attempt"] == first_attempt(run)
-        run["jobs"] = [
-            {
-                "id": job["id"],
-                "workflow": run["name"],
-                "job": job["name"],
-                "url": f"{run['html_url']}/job/{job['id']}",
+    candidate = latest_run()
+    if (
+        candidate is not None
+        and source_run(candidate, default_branch)
+        and run_key(candidate) not in state["processed"]
+    ):
+        if jobs := failed_jobs(candidate):
+            run = {
+                key: candidate[key]
+                for key in (
+                    "id",
+                    "run_attempt",
+                    "head_sha",
+                    "name",
+                    "path",
+                    "event",
+                    "head_branch",
+                    "status",
+                    "conclusion",
+                )
             }
-            for job in jobs
-        ]
-        runs.append(run)
+            run["html_url"] = (
+                f"https://github.com/{REPOSITORY}/actions/runs/{run['id']}"
+                f"/attempts/{run['run_attempt']}"
+            )
+            run["retry_available"] = run["run_attempt"] == 1
+            run["jobs"] = [
+                {
+                    "id": job["id"],
+                    "workflow": run["name"],
+                    "job": job["name"],
+                    "url": f"{run['html_url']}/job/{job['id']}",
+                }
+                for job in jobs
+            ]
+            runs.append(run)
     write_json(
         out_dir / "snapshot.json",
         {"repository": REPOSITORY, "runs": runs, "issues": load_issues(), "state": state},
@@ -222,9 +201,7 @@ def validate_report(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
         raise ValueError("Unsupported repository")
     known_jobs = {job["url"]: public_job(job) for run in snapshot["runs"] for job in run["jobs"]}
     retry_available = {
-        job["url"]: run["run_attempt"] == first_attempt(run)
-        for run in snapshot["runs"]
-        for job in run["jobs"]
+        job["url"]: run["run_attempt"] == 1 for run in snapshot["runs"] for job in run["jobs"]
     }
     open_issues = {issue["number"] for issue in snapshot["issues"] if nightly_issue(issue)}
     seen = set()
@@ -248,7 +225,7 @@ def validate_report(report: dict[str, Any], snapshot: dict[str, Any]) -> None:
 
 
 def fresh_run(run: dict[str, Any]) -> dict[str, Any]:
-    current = latest_run(run["path"].split("@")[0])
+    current = latest_run()
     if (
         current is None
         or current["id"] != run["id"]
@@ -388,7 +365,7 @@ def post_check(
         if transient and not all(verdicts[job["url"]] == {"transient"} for job in run["jobs"]):
             plan["blocked_reruns"].append({"run_id": run["id"], "reason": "mixed_causes"})
             continue
-        if not transient or run["run_attempt"] != first_attempt(run) or key in state["reruns"]:
+        if not transient or run["run_attempt"] != 1 or key in state["reruns"]:
             continue
         plan["reruns"].append({"run_id": run["id"], "expected_run_attempt": run["run_attempt"]})
         if apply:
@@ -406,7 +383,7 @@ def post_check(
 
 def run(args: argparse.Namespace) -> None:
     if args.nightly_command == "collect":
-        collect(args.out_dir, args.workflow)
+        collect(args.out_dir)
         return
     report = json.loads(args.report.read_text())
     snapshot = json.loads(args.snapshot.read_text())
@@ -422,9 +399,6 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     commands = parser.add_subparsers(dest="nightly_command", required=True)
     collect_parser = commands.add_parser("collect")
     collect_parser.add_argument("--out-dir", type=Path, required=True)
-    collect_parser.add_argument(
-        "--workflow", choices=[path.rsplit("/", 1)[-1] for path in source_workflows()]
-    )
     check_parser = commands.add_parser("post-check")
     for name in ("snapshot", "report"):
         check_parser.add_argument(f"--{name}", type=Path, required=True)
