@@ -142,7 +142,7 @@ timeout --kill-after=10s 30m srt --settings "$sandbox_settings" -- \
     --setting-sources project \
     --settings '{"worktree":{"baseRef":"head"}}' \
     --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-    --tools Agent,Bash,Read,Grep,Glob,Write \
+    --tools Agent,Bash,Read,Grep,Glob,Write,Edit \
     --no-session-persistence \
     --print --verbose --output-format stream-json --forward-subagent-text \
     "/nightly $context_dir/inventory.json $context_dir/issues.json $out_dir" \
